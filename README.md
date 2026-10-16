@@ -1,24 +1,38 @@
 # Spektrum.de – Leseransicht
 
-Ein Userscript für eine ruhige Spektrum-Startseite: redaktionelle Beiträge, klare Typografie und möglichst wenig Ablenkung.
+Ein Userscript für einen ruhigen Wissenschaftsüberblick: Nachrichten, Datum, Vorspann und Bilder. Ohne laufende KI, API-Schlüssel, Backend oder zusätzliche Paketabhängigkeiten.
 
-## Verwenden
+## Installieren und aktualisieren
 
-[Userscript installieren oder aktualisieren](https://raw.githubusercontent.com/ThisIsBert/Test_LAnsicht/main/spektrum-leseransicht.user.js), die Aktualisierung im Userscript-Manager (zum Beispiel Tampermonkey oder Violentmonkey) bestätigen und `https://www.spektrum.de/` neu laden. In der Kopfzeile und im Fußbereich steht die aktive Version, derzeit **0.4.1**. Im Script sind die Download- und Update-Adressen für spätere Aktualisierungen hinterlegt. Ein GitHub-Upload allein aktualisiert bereits installierte Kopien nicht sofort; der Knopf **↻** aktualisiert nur die Artikelauswahl.
+[Userscript installieren oder aktualisieren](https://raw.githubusercontent.com/ThisIsBert/Test_LAnsicht/main/spektrum-leseransicht.user.js), die Aktualisierung im Userscript-Manager (zum Beispiel Tampermonkey oder Violentmonkey) bestätigen und `https://www.spektrum.de/` neu laden. Die aktive Version **0.5.0** steht im Kopf- und Fußbereich. Im Manager sollte nur eine Kopie aktiviert sein. Download- und Update-Adressen für spätere Aktualisierungen sind hinterlegt.
 
-Falls weiterhin sechs Bildkarten erscheinen oder die Schalter **Magazin/Kompakt** fehlen, läuft eine ältere Kopie. Im Userscript-Manager prüfen, dass nur eine Version aktiviert ist. Das Script verändert nur die Startseite. Artikel öffnen sich wie gewohnt auf Spektrum.de; bestehende Zugangs- und Abobedingungen gelten weiter.
+Das Script verändert die Darstellung der Startseite. Artikel öffnen sich weiterhin auf Spektrum.de; Zugangs- und Abobedingungen gelten wie gewohnt. **Originalseite** oder Escape zeigen die ursprüngliche Seite wieder an.
 
-- **Magazin** zeigt einen Aufmacher, bis zu drei Bildkarten und einen kurzen Überblick.
-- **Kompakt** zeigt dieselben Beiträge als reine Textliste in der Reihenfolge der ursprünglichen Startseite. Die Wahl wird lokal im Browser gespeichert, sofern erlaubt.
-- Standardmäßig wird nur der obere aktuelle Überblick der Startseite eingelesen, vor den benannten Magazin- und Themenblöcken. **Weitere Rubriken einbeziehen** erweitert diese Auswahl. **Nachrichten** grenzt die jeweilige Auswahl auf die Artikelart `/news/` ein; diese URL allein sagt nichts über das Alter eines Artikels aus.
-- Rubrikfilter grenzen die Auswahl ein. Zunächst erscheinen maximal zwölf Überblickszeilen; weitere lassen sich aufklappen.
-- **Originalseite** oder die Escape-Taste kehren zur ursprünglichen Seite zurück. **↻** liest die bereits geladene Seite erneut ein; es lädt keine neuen Nachrichten vom Server.
+## Was angezeigt wird
 
-„Meistgelesen“, „Das Beste von Spektrum.de“, Shop- und Werbeblöcke werden nicht übernommen, auch nicht bei aktivierten weiteren Rubriken. Neben den DOM-Blöcken werden die Empfehlungskennzeichnungen `itm_campaign=meistgelesen` und `itm_campaign=articles-of-interest` an den Links geprüft. Ein Artikel, der zugleich im normalen aktuellen Bereich erscheint, bleibt dort erhalten. Die Auswahl und Reihenfolge stammen von der geladenen Seite; das Script ermittelt keine Veröffentlichungsdaten und garantiert kein bestimmtes Höchstalter. „Aktuell“ bezeichnet den oberen redaktionellen Bereich, keine Prüfung des Veröffentlichungsdatums.
+Die Inhalte kommen ausschließlich aus dem [offiziellen Spektrum-RSS-Feed](https://www.spektrum.de/alias/rss/spektrum-de-rss-feed/996406). Die frühere Extraktion aus Startseitenblöcken ist entfernt.
+
+- Standard: **Nachrichten der letzten drei Tage** (72 Stunden), neueste zuerst. Die jüngste Nachricht ist der Aufmacher, auch wenn sie kein Bild hat. Bildgröße und ursprüngliche Teaserposition beeinflussen die Reihenfolge nicht.
+- **Alle Formate**, Kolumnen, Podcasts und weitere im Feed enthaltene Formate lassen sich getrennt auswählen. Bei null Nachrichten bleibt die Auswahl leer; das Script wechselt nicht automatisch zu anderen Formaten.
+- **Zeitraum** bietet drei Tage, sieben Tage oder alle vorhandenen Feed-Beiträge. Fehlende, ungültige oder zukünftige Datumsangaben werden nicht als aktuell behandelt. Beiträge ohne verwertbares Veröffentlichungsdatum sind nur bei „Alle Feed-Beiträge“ sichtbar und als „Datum unbekannt“ gekennzeichnet.
+- Jeder Beitrag zeigt das Veröffentlichungsdatum aus dem Feed in der Zeitzone des Browsers. Das Datum ist eine Angabe des Verlags, keine unabhängig verifizierte Datierung.
+- **Magazin** zeigt den neuesten Beitrag als Aufmacher, die nächsten drei als Karten und den Rest als Überblick. **Kompakt** zeigt dieselbe chronologische Auswahl als Textliste. Die Layoutwahl wird lokal gespeichert, sofern erlaubt.
+- Im Überblick stehen zunächst maximal zwölf Zeilen. Weitere lassen sich aufklappen.
+- **↻** ruft den Feed neu ab und erhält Format-, Zeitraum- und Layoutwahl. Während des Abrufs wird der Knopf deaktiviert. Der Abruf bricht nach zwölf Sekunden ab.
+
+Werbung, Shop, Newsletter-Promos, „Meistgelesen“ und „Das Beste von Spektrum.de“ werden nicht aus der Startseite übernommen. Im Feed ausdrücklich als Anzeige, Werbung, Sponsored oder Partnerinhalt gekennzeichnete Beiträge werden ausgeschlossen. Übersetzte wissenschaftliche Beiträge werden nicht pauschal ausgeschlossen; maßgeblich sind ihre Artikelart und ihr Feed-Datum.
+
+## Grenzen und Fehlerfälle
+
+Der Feed lieferte bei der Entwicklung 20 Einträge. Er ist kein vollständiges Archiv: Ein längerer Zeitraum lädt keine älteren Artikel nach. Es werden weder Artikelseiten einzeln abgerufen noch eine KI-Bewertung oder persönliche Relevanzsortierung vorgenommen.
+
+Der Feed wird vom gleichen Ursprung wie die geöffnete Spektrum-Seite geladen. Es sind keine zusätzlichen Userscript-Berechtigungen erforderlich. Bei einem fehlgeschlagenen Abruf erscheint eine Fehlermeldung mit Wiederholungsmöglichkeit; bereits geladene Beiträge bleiben bei einem Aktualisierungsfehler erhalten. Das Script mischt dann keine undatierten Inhalte aus dem Startseiten-DOM hinzu. Bilder, die nicht laden, weichen einer Textdarstellung.
+
+Das Script blendet die ursprünglichen Seitenelemente aus. Es ist kein Netzwerk-Werbeblocker: Im Hintergrund gestartete Skripte der Originalseite können weiterhin ausgeführt werden. Abonnements und Bezahlschranken werden nicht umgangen.
 
 ## Entwickeln und prüfen
 
-Kein Build und keine Laufzeit-Paketabhängigkeiten. Syntax prüfen:
+Kein Build erforderlich. Syntaxprüfung:
 
 ```sh
 node --check spektrum-leseransicht.user.js
@@ -30,4 +44,4 @@ Die Browser-Regressionstests benötigen Python 3, das Python-Paket `playwright` 
 python3 -m unittest discover -s tests -v
 ```
 
-Die Tests verwenden kontrollierte HTML-Ausschnitte, deren Listen- und Karussellstruktur der Spektrum-Startseite entspricht. Sie benötigen keinen Netzwerkzugriff und prüfen unter anderem ausgeschlossene Sammelblöcke, mehrfach platzierte Artikel, verzögert geladene Bilder, Ansichtswechsel, Tastaturbedienung und mobile Darstellung. Änderungen an der echten Website können eine Anpassung der DOM-Erkennung erfordern.
+Die Tests führen den tatsächlichen RSS-Abrufcode im Browser mit kontrollierten Antworten aus. Sie prüfen zeitliche Sortierung, Format- und Zeitraumfilter, Duplikate, HTML-Bereinigung, Lade- und Fehlerzustände, Aktualisierung, Tastaturbedienung, Layoutwahl und mobile Darstellung. Sie benötigen keinen Netzwerkzugriff.

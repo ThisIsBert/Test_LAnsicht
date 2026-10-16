@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Spektrum.de – Leseransicht
 // @namespace    https://github.com/ThisIsBert/Spektrum-Userscripts
-// @version      0.4.1
+// @version      0.5.0
 // @downloadURL  https://raw.githubusercontent.com/ThisIsBert/Test_LAnsicht/main/spektrum-leseransicht.user.js
 // @updateURL    https://raw.githubusercontent.com/ThisIsBert/Test_LAnsicht/main/spektrum-leseransicht.user.js
 // @description  Eine ruhige, redaktionelle Spektrum-Startseite – ohne Shop, Abo, Werbung und Verlagspromos.
@@ -19,7 +19,8 @@
   const ROOT_ID = 'spektrum-reader-view';
   const GLOBAL_STYLE_ID = 'spektrum-reader-global-style';
   const ACTIVE_CLASS = 'spektrum-reader-active';
-  const VERSION = '0.4.1';
+  const VERSION = '0.5.0';
+  const FEED_PATH = '/alias/rss/spektrum-de-rss-feed/996406';
   const INITIAL_OVERVIEW_COUNT = 12;
   const LAYOUT_KEY = 'spektrum-reader-layout';
 
@@ -42,11 +43,14 @@
 
   const state = {
     active: true,
-    filter: 'all',
+    filter: 'news',
     items: [],
     expanded: false,
     layout: savedLayout(),
-    includeSections: false,
+    days: '3',
+    loading: false,
+    error: false,
+    updatedAt: null,
     readerScroll: 0,
     originalScroll: 0
   };
@@ -55,11 +59,6 @@
   const escapeHtml = (s = '') => String(s).replace(/[&<>"']/g, ch => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;'
   }[ch]));
-
-  function absoluteUrl(value) {
-    if (!value) return '';
-    try { return new URL(value, location.href).href; } catch { return ''; }
-  }
 
   function canonicalUrl(value) {
     try {
@@ -102,317 +101,65 @@
     }
   }
 
-  function isCommercialOrSponsored(node) {
-    if (!node) return false;
-    const text = norm(node.textContent || '');
-    const cls = node.className ? String(node.className) : '';
-    const commercialClass = /(?:^|\s)(?:kiosk|product-actions|advert|ad-container|native-ad|sponsored)(?:\s|$)/i.test(cls);
-    const explicitLabel = /^(?:anzeige|werbung|sponsored|partnerinhalt|partnerinhalte)$/i.test(text);
-    return commercialClass || explicitLabel;
+  function plainText(value) {
+    const template = document.createElement('template');
+    template.innerHTML = value || '';
+    template.content.querySelectorAll('script, style, iframe, object').forEach(node => node.remove());
+    return norm(template.content.textContent);
   }
 
-  function findCard(anchor) {
-    // Choose the nearest individual card, never an outer list's heading.
-    return anchor.closest('article, li, .teaser') || anchor.parentElement;
-  }
-
-  function isRecommendationLink(anchor) {
-    // Read tracking before canonicalUrl removes it. These markers are also
-    // available when a carousel is moved or its heading has not loaded yet.
+  function feedImage(item) {
+    const media = [...item.getElementsByTagNameNS('http://search.yahoo.com/mrss/', 'content')]
+      .find(node => node.getAttribute('medium') === 'image' || /^image\//i.test(node.getAttribute('type') || ''));
+    const enclosure = [...item.querySelectorAll('enclosure')]
+      .find(node => /^image\//i.test(node.getAttribute('type') || ''));
+    const value = media?.getAttribute('url') || enclosure?.getAttribute('url');
+    if (!value) return null;
     try {
-      const campaign = new URL(anchor.href).searchParams.get('itm_campaign') || '';
-      return /^(?:meistgelesen|articles-of-interest)$/i.test(campaign);
-    } catch { return false; }
+      const url = new URL(value, location.href);
+      if (!/^https?:$/.test(url.protocol) || !/(^|\.)spektrum\.de$/i.test(url.hostname)) return null;
+      return { src: url.href, alt: '' };
+    } catch { return null; }
   }
 
-  function currentSectionEnd(scope) {
-    // The main editorial stream precedes the named magazine/topic sections.
-    // Sidebar headings such as Meistgelesen must not terminate that stream.
-    return [...scope.querySelectorAll('.teaser-area, .teaser-category')]
-      .find(node => !node.closest('aside, article') && norm(node.textContent)) || null;
-  }
-
-  function excludedCollections(scope) {
-    const roots = [...scope.querySelectorAll('.kiosk, .product-actions, .advert, .ad-container, .native-ad, .sponsored')];
-    for (const heading of scope.querySelectorAll('h2, h3, h4, [role="heading"]')) {
-      if (!/^(?:meistgelesen|das beste von spektrum\s*\.\s*de)[.!:]?$/i.test(norm(heading.textContent))) continue;
-      // Collection headings sit above their links. Exclude only that occurrence,
-      // so an article also present in the normal news stream is still retained.
-      for (let block = heading.parentElement; block && block !== scope; block = block.parentElement) {
-        if ([...block.querySelectorAll('a[href]')].some(a => isEditorialUrl(a.href))) {
-          roots.push(block);
-          break;
-        }
-      }
-    }
-    return roots;
-  }
-
-  function cardPriority(card) {
-    const cls = card?.className ? String(card.className) : '';
-    if (/teaser__wide/.test(cls)) return 100;
-    if (/teaser__full/.test(cls)) return 95;
-    if (/teaser__large/.test(cls)) return 90;
-    if (/teaser__grid/.test(cls)) return 75;
-    if (/teaser__small/.test(cls)) return 65;
-    if (/teaser__line/.test(cls) || card?.matches('li.teaser__line__left')) return 30;
-    if (card?.matches('article')) return 55;
-    return 40;
-  }
-
-  function cleanHeadingText(el) {
-    if (!el) return '';
-    const clone = el.cloneNode(true);
-    clone.querySelectorAll([
-      '.teaser__small__heading__kicker',
-      '.teaser__large__heading__kicker',
-      '.show-for-sr',
-      '[class*="kicker"]'
-    ].join(',')).forEach(n => n.remove());
-    return norm(clone.textContent).replace(/^[:|–—-]+\s*/, '');
-  }
-
-  function extractKicker(card, anchor) {
-    const explicit = card?.querySelector([
-      '.teaser__wide__kicker',
-      '.teaser__small__heading__kicker',
-      '.teaser__large__heading__kicker',
-      '.teaser__grid__kicker',
-      '[class*="__kicker"]',
-      '[class*="kicker"]'
-    ].join(','));
-    if (explicit) return norm(explicit.textContent);
-
-    if (card?.matches('li.teaser__line__left')) {
-      const firstSpan = anchor.querySelector(':scope > span');
-      if (firstSpan) return norm(firstSpan.textContent);
-    }
-
-    return '';
-  }
-
-  function extractTitle(card, anchor, kicker) {
-    const titleSelector = [
-      '.teaser__wide__title',
-      '.teaser__grid__title',
-      '.teaser__full__title',
-      '.teaser__small__heading',
-      '.teaser__large__heading',
-      'h1', 'h2', 'h3', 'h4'
-    ].join(',');
-    const titleEl = anchor.querySelector(titleSelector) || card?.querySelector(titleSelector);
-
-    let title = cleanHeadingText(titleEl);
-
-    if (!title && card?.matches('li.teaser__line__left')) {
-      const clone = anchor.cloneNode(true);
-      clone.querySelectorAll('span').forEach(n => n.remove());
-      title = norm(clone.textContent).replace(/^\s*[|:–—-]+\s*/, '');
-    }
-
-    if (!title) title = norm(anchor.textContent);
-
-    if (kicker && title.toLocaleLowerCase('de-DE').startsWith(kicker.toLocaleLowerCase('de-DE'))) {
-      title = norm(title.slice(kicker.length)).replace(/^\s*[:|–—-]+\s*/, '');
-    }
-
-    return title;
-  }
-
-  function extractTeaser(card, title, kicker) {
-    const explicit = card?.querySelector([
-      '.teaser__wide__text',
-      '.teaser__small__text',
-      '.teaser__large__text',
-      '.teaser__grid__text',
-      '.teaser__full__text',
-      'figcaption .show-for-medium',
-      '[class*="teaser__grid__text"]'
-    ].join(','));
-    if (explicit) return norm(explicit.textContent);
-
-    const p = card?.querySelector('p');
-    if (p) return norm(p.textContent);
-
-    const blocks = [...(card?.querySelectorAll('div') || [])]
-      .map(el => norm(el.textContent))
-      .filter(text => text && text !== title && text !== kicker && text.length >= 45 && text.length <= 500);
-
-    return blocks.sort((a, b) => a.length - b.length)[0] || '';
-  }
-
-  function urlFromSrcset(value) {
-    if (!value) return '';
-    const entries = String(value).split(',')
-      .map(part => part.trim())
-      .filter(Boolean)
-      .map(part => {
-        const bits = part.split(/\s+/);
-        const descriptor = bits[1] || '';
-        const width = Number(descriptor.replace(/\D/g, '')) || 0;
-        return { url: bits[0], width };
-      })
-      .filter(entry => entry.url);
-
-    entries.sort((a, b) => b.width - a.width);
-    return entries[0]?.url || '';
-  }
-
-  function imageUrl(img) {
-    const candidates = [
-      img.currentSrc,
-      img.getAttribute('src'),
-      img.getAttribute('data-src'),
-      img.getAttribute('data-lazy-src'),
-      img.getAttribute('data-original'),
-      urlFromSrcset(img.getAttribute('srcset')),
-      urlFromSrcset(img.getAttribute('data-srcset')),
-      urlFromSrcset(img.closest('picture')?.querySelector('source[srcset]')?.getAttribute('srcset'))
-    ];
-
-    for (const candidate of candidates) {
-      const url = absoluteUrl(candidate);
-      if (!url || /^data:/i.test(url)) continue;
-      return url;
-    }
-    return '';
-  }
-
-  function imageScore(img, src = imageUrl(img)) {
-    if (!img || !src) return -1;
-    if (img.matches('.image__author') || img.closest('.author-img-wrap')) return -100000;
-    if (/avatar|author|logo|icon/i.test(`${img.className || ''} ${src}`)) return -50000;
-
-    const fromUrl = src.match(/f(\d+)x(\d+)/i);
-    const w = img.naturalWidth || img.width || Number(fromUrl?.[1]) || 0;
-    const h = img.naturalHeight || img.height || Number(fromUrl?.[2]) || 0;
-    return w * h || 1;
-  }
-
-  function extractImage(card) {
-    const imageNodes = [...(card?.querySelectorAll('img') || [])];
-    // Lazy images may still live inside noscript when document-idle fires.
-    for (const node of card?.querySelectorAll('noscript') || []) {
-      const template = document.createElement('template');
-      template.innerHTML = node.textContent;
-      imageNodes.push(...template.content.querySelectorAll('img'));
-    }
-    const images = imageNodes
-      .map(img => {
-        const src = imageUrl(img);
-        return { img, src, quality: imageScore(img, src) };
-      })
-      .filter(entry => entry.src && entry.quality > 0)
-      .sort((a, b) => b.quality - a.quality);
-
-    if (images[0]) {
-      return {
-        src: images[0].src,
-        alt: norm(images[0].img.getAttribute('alt') || ''),
-        quality: images[0].quality
-      };
-    }
-
-    const bgNode = [...(card?.querySelectorAll('[style*="background-image"]') || [])]
-      .find(el => /url\(/i.test(el.getAttribute('style') || ''));
-    const match = bgNode?.getAttribute('style')?.match(/background-image\s*:\s*url\(["']?([^"')]+)["']?\)/i);
-    const bgUrl = absoluteUrl(match?.[1]);
-    return bgUrl ? { src: bgUrl, alt: '', quality: 1 } : null;
-  }
-
-  function extractAuthor(card) {
-    const el = card?.querySelector([
-      '.teaser__wide__author',
-      '.teaser__large__author',
-      '[class*="teaser"][class*="author"]'
-    ].join(','));
-    return el ? norm(el.textContent) : '';
-  }
-
-  function candidateFrom(anchor, order) {
-    const url = canonicalUrl(anchor.href);
-    const card = findCard(anchor);
-    if (!url || !card || isCommercialOrSponsored(card)) return null;
-
-    const type = getType(url);
-    const kicker = extractKicker(card, anchor);
-    const title = extractTitle(card, anchor, kicker);
-    const teaser = extractTeaser(card, title, kicker);
-    const image = extractImage(card);
-    const author = extractAuthor(card);
-    const originalClass = card.className ? String(card.className) : '';
-    const priority = cardPriority(card);
-
-    if (!title || title.length < 8) return null;
-    if (/^(?:sponsored|partnerinhalte?|neuerscheinungen|abonnement|bestellen)$/i.test(title)) return null;
-
-    return {
-      url,
-      type,
-      typeLabel: ALLOWED_TYPES.get(type)?.label || 'Artikel',
-      kicker,
-      title,
-      teaser,
-      image,
-      author,
-      originalClass,
-      priority,
-      featured: priority >= 90,
-      order
-    };
-  }
-
-  function mergeCandidate(oldItem, newItem) {
-    if (!oldItem) return newItem;
-
-    const richness = item => item.priority + (item.image ? 25 : 0) + (item.teaser ? 8 : 0) + (item.author ? 2 : 0);
-    const newWins = oldItem.current !== newItem.current ? newItem.current : richness(newItem) > richness(oldItem);
-    const base = { ...(newWins ? newItem : oldItem) };
-    const other = newWins ? oldItem : newItem;
-
-    base.order = Math.min(oldItem.order, newItem.order);
-    base.priority = Math.max(oldItem.priority, newItem.priority);
-    base.featured = oldItem.featured || newItem.featured;
-    base.current = oldItem.current || newItem.current;
-    base.kicker ||= other.kicker;
-    base.author ||= other.author;
-
-    if (!base.teaser || (other.teaser && other.teaser.length > base.teaser.length && other.teaser.length < 600)) {
-      base.teaser = other.teaser || base.teaser;
-    }
-
-    if (!base.image || (other.image && (other.image.quality || 0) > (base.image.quality || 0))) {
-      base.image = other.image || base.image;
-    }
-
-    return base;
-  }
-
-  function extractItems() {
-    const scope = document.querySelector('#main') || document.querySelector('main') || document.body;
-    const excluded = excludedCollections(scope);
-    const sectionEnd = currentSectionEnd(scope);
-    const anchors = [...scope.querySelectorAll('a[href]')]
-      .filter(a => isEditorialUrl(a.href) && !isRecommendationLink(a) && !excluded.some(block => block.contains(a)));
+  function parseFeed(text) {
+    const xml = new DOMParser().parseFromString(text, 'application/xml');
+    if (xml.querySelector('parsererror') || !xml.querySelector('rss > channel')) throw new Error('Invalid RSS feed');
     const byUrl = new Map();
+    for (const item of xml.querySelectorAll('channel > item')) {
+      const url = canonicalUrl(norm(item.querySelector('link')?.textContent));
+      if (!isEditorialUrl(url)) continue;
+      const categories = [...item.querySelectorAll('category')].map(node => norm(node.textContent));
+      if (categories.some(label => /^(?:anzeige|werbung|sponsored|partnerinhalte?)$/i.test(label))) continue;
+      const title = plainText(item.querySelector('title')?.textContent);
+      if (!title) continue;
+      const type = getType(url);
+      const timestamp = Date.parse(item.querySelector('pubDate')?.textContent || '');
+      const publishedAt = Number.isFinite(timestamp) ? timestamp : null;
+      const author = [...item.getElementsByTagNameNS('http://www.w3.org/2005/Atom', 'name')]
+        .map(node => norm(node.textContent)).filter(Boolean).join(', ');
+      const entry = {
+        url, type, title, typeLabel: ALLOWED_TYPES.get(type).label,
+        teaser: plainText(item.querySelector('description')?.textContent),
+        image: feedImage(item), author, publishedAt
+      };
+      const previous = byUrl.get(url);
+      if (!previous || (publishedAt ?? -Infinity) > (previous.publishedAt ?? -Infinity)) byUrl.set(url, entry);
+    }
+    // Stable chronological order; missing dates remain visible only under "all".
+    return [...byUrl.values()].sort((a, b) => (b.publishedAt ?? -Infinity) - (a.publishedAt ?? -Infinity));
+  }
 
-    anchors.forEach((anchor, order) => {
-      const candidate = candidateFrom(anchor, order);
-      if (!candidate) return;
-      candidate.current = !sectionEnd || Boolean(anchor.compareDocumentPosition(sectionEnd) & Node.DOCUMENT_POSITION_FOLLOWING);
-      byUrl.set(candidate.url, mergeCandidate(byUrl.get(candidate.url), candidate));
-    });
-
-    return [...byUrl.values()].sort((a, b) => a.order - b.order);
+  function dateHtml(item) {
+    if (item.publishedAt === null) return '<span>Datum unbekannt</span>';
+    const date = new Date(item.publishedAt);
+    const label = date.toLocaleString('de-DE', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' });
+    return `<time datetime="${date.toISOString()}" title="${escapeHtml(date.toLocaleString('de-DE'))}">${escapeHtml(label)}</time>`;
   }
 
   function formatMeta(item) {
-    const parts = [];
-    if (item.kicker && item.type !== 'news') parts.push(item.typeLabel);
-    if (item.kicker) parts.push(item.kicker);
-    else parts.push(item.typeLabel);
-    if (item.author) parts.push(item.author.replace(/^von\s+/i, 'von '));
-    return parts.join(' · ');
+    const author = item.type === 'kolumne' && item.author ? ` · ${escapeHtml(item.author)}` : '';
+    return `${escapeHtml(item.typeLabel)} · ${dateHtml(item)}${author}`;
   }
 
   function heroHtml(item) {
@@ -426,7 +173,7 @@
         <a href="${escapeHtml(item.url)}">
           ${image}
           <div class="hero-copy">
-            <div class="meta">${escapeHtml(formatMeta(item))}</div>
+            <div class="meta">${formatMeta(item)}</div>
             <h2>${escapeHtml(item.title)}</h2>
             ${teaser}
             <span class="read-more">Lesen <span aria-hidden="true">→</span></span>
@@ -439,9 +186,9 @@
     return `
       <article class="visual-card" data-type="${escapeHtml(item.type)}">
         <a href="${escapeHtml(item.url)}">
-          <div class="visual-image"><img src="${escapeHtml(item.image.src)}" alt="${escapeHtml(item.image.alt)}" loading="lazy"></div>
+          ${item.image ? `<div class="visual-image"><img src="${escapeHtml(item.image.src)}" alt="${escapeHtml(item.image.alt)}" loading="lazy"></div>` : ''}
           <div class="visual-copy">
-            <div class="meta">${escapeHtml(formatMeta(item))}</div>
+            <div class="meta">${formatMeta(item)}</div>
             <h2>${escapeHtml(item.title)}</h2>
             ${item.teaser ? `<p>${escapeHtml(item.teaser)}</p>` : ''}
           </div>
@@ -454,7 +201,7 @@
       <article class="overview-item" data-type="${escapeHtml(item.type)}">
         <a href="${escapeHtml(item.url)}">
           <div class="overview-copy">
-            <div class="overview-meta">${escapeHtml(formatMeta(item))}</div>
+            <div class="overview-meta">${formatMeta(item)}</div>
             <h3>${escapeHtml(item.title)}</h3>
             ${item.teaser ? `<p>${escapeHtml(item.teaser)}</p>` : ''}
           </div>
@@ -468,26 +215,25 @@
   }
 
   function availableItems() {
-    return state.includeSections ? state.items : state.items.filter(item => item.current);
+    if (state.days === 'all') return state.items;
+    const now = Date.now();
+    const cutoff = now - Number(state.days) * 86400000;
+    return state.items.filter(item => item.publishedAt !== null && item.publishedAt >= cutoff && item.publishedAt <= now);
   }
 
   function renderFilters(shadow) {
-    const items = availableItems();
-    if (state.filter !== 'all' && !items.some(item => item.type === state.filter)) state.filter = 'all';
-    shadow.querySelector('.filters').innerHTML = filterButtons(items);
-    shadow.querySelectorAll('.filter').forEach(btn => {
-      const active = btn.dataset.filter === state.filter;
-      btn.classList.toggle('is-active', active);
-      btn.setAttribute('aria-pressed', String(active));
-    });
-    shadow.querySelector('#selection-note').textContent = state.includeSections
-      ? 'Beiträge aus allen redaktionellen Rubriken.' : 'Der aktuelle Überblick der Startseite.';
+    shadow.querySelector('.filters').innerHTML = filterButtons(availableItems());
   }
 
-  function rankForHero(a, b) {
-    if (b.priority !== a.priority) return b.priority - a.priority;
-    if (Boolean(b.image) !== Boolean(a.image)) return Number(Boolean(b.image)) - Number(Boolean(a.image));
-    return a.order - b.order;
+  function renderFeedStatus(shadow) {
+    const status = shadow.querySelector('#feed-status');
+    status.classList.toggle('is-error', state.error);
+    status.setAttribute('role', state.error ? 'alert' : 'status');
+    status.textContent = state.loading ? 'Beiträge werden geladen …'
+      : state.error ? (state.updatedAt ? 'Aktualisierung fehlgeschlagen. Die zuletzt geladenen Beiträge bleiben sichtbar.' : 'Beiträge konnten nicht geladen werden. Bitte erneut versuchen oder die Originalseite öffnen.')
+      : `Zuletzt geladen: ${state.updatedAt.toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' })} · ${state.items.length} Beiträge im Feed`;
+    shadow.querySelector('#reader-content').setAttribute('aria-busy', String(state.loading));
+    shadow.querySelector('#refresh').disabled = state.loading;
   }
 
   function renderContent(shadow) {
@@ -499,18 +245,16 @@
     count.textContent = `${list.length} ${list.length === 1 ? 'Beitrag' : 'Beiträge'}`;
 
     if (!list.length) {
-      content.innerHTML = `<div class="empty"><strong>Nichts gefunden.</strong><br>Für diesen Filter enthält die aktuelle Startseite keine Beiträge.</div>`;
+      content.innerHTML = state.loading ? '<div class="empty">Die neuesten Beiträge werden geladen …</div>'
+        : state.error && !state.updatedAt ? '<div class="empty"><strong>Der Nachrichtenabruf ist fehlgeschlagen.</strong><p><button class="secondary" type="button" id="retry-feed">Erneut versuchen</button></p></div>'
+        : '<div class="empty"><strong>Keine Beiträge in dieser Auswahl.</strong><br>Wähle einen anderen Zeitraum oder „Alle Formate“.</div>';
       return;
     }
 
     const compact = state.layout === 'compact';
-    const heroPool = list.some(item => item.image) ? list.filter(item => item.image) : list;
-    const hero = compact ? null : [...heroPool].sort(rankForHero)[0];
+    const hero = compact ? null : list[0];
     const remaining = list.filter(item => item.url !== hero?.url);
-    const visual = remaining
-      .filter(item => !compact && item.image)
-      .sort((a, b) => (b.priority - a.priority) || (a.order - b.order))
-      .slice(0, 3);
+    const visual = compact ? [] : remaining.slice(0, 3);
 
     const visualUrls = new Set(visual.map(item => item.url));
     const overview = remaining.filter(item => !visualUrls.has(item.url));
@@ -546,14 +290,14 @@
 
     const preferred = ['news', 'kolumne', 'podcast', 'video', 'frage', 'raetsel', 'rezension', 'wissen', 'leseprobe'];
     const buttons = preferred
-      .filter(type => counts.has(type))
-      .map(type => `<button class="filter" type="button" data-filter="${type}" aria-pressed="false">${escapeHtml(ALLOWED_TYPES.get(type).plural)} <span>${counts.get(type)}</span></button>`)
+      .filter(type => counts.has(type) || type === 'news' || type === state.filter)
+      .map(type => `<button class="filter${state.filter === type ? ' is-active' : ''}" type="button" data-filter="${type}" aria-pressed="${state.filter === type}">${escapeHtml(ALLOWED_TYPES.get(type).plural)} <span>${counts.get(type) || 0}</span></button>`)
       .join('');
 
-    return `<button class="filter is-active" type="button" data-filter="all" aria-pressed="true">Alle <span>${items.length}</span></button>${buttons}`;
+    return `<button class="filter${state.filter === 'all' ? ' is-active' : ''}" type="button" data-filter="all" aria-pressed="${state.filter === 'all'}">Alle Formate <span>${items.length}</span></button>${buttons}`;
   }
 
-  function shellHtml(items) {
+  function shellHtml() {
     return `
       <div id="reader-shell" class="reader-shell">
         <header class="topbar">
@@ -563,7 +307,7 @@
               <div><strong>Spektrum</strong><span>Leseransicht · ${VERSION}</span></div>
             </div>
             <nav class="actions" aria-label="Ansicht">
-              <button id="refresh" class="icon-button" type="button" title="Inhalte neu einlesen" aria-label="Inhalte neu einlesen">↻</button>
+              <button id="refresh" class="icon-button" type="button" title="Neue Beiträge laden" aria-label="Neue Beiträge laden">↻</button>
               <button id="show-original" class="secondary" type="button">Originalseite</button>
             </nav>
           </div>
@@ -573,8 +317,8 @@
           <div class="intro">
             <div>
               <p class="eyebrow">Wissenschaft ohne Umwege</p>
-              <h1>Was heute lesenswert ist.</h1>
-              <p class="intro-copy" id="selection-note">Der aktuelle Überblick der Startseite.</p>
+              <h1>Neu bei Spektrum.</h1>
+              <p class="intro-copy">Wissenschaft entdecken. Nach Datum geordnet.</p>
             </div>
             <div class="intro-tools">
               <div id="article-count" class="count" role="status" aria-live="polite" aria-atomic="true"></div>
@@ -584,10 +328,15 @@
               </div>
             </div>
           </div>
-          <label class="section-choice"><input id="include-sections" type="checkbox"> Weitere Rubriken einbeziehen</label>
-          <nav class="filters" aria-label="Inhalte filtern">${filterButtons(items.filter(item => item.current))}</nav>
+          <div class="feed-tools">
+            <label class="period-choice">Zeitraum <select id="period">
+              <option value="3">Letzte 3 Tage</option><option value="7">Letzte 7 Tage</option><option value="all">Alle Feed-Beiträge</option>
+            </select></label>
+            <div id="feed-status" class="feed-status" role="status" aria-live="polite"></div>
+          </div>
+          <nav class="filters" aria-label="Formate filtern">${filterButtons([])}</nav>
           <div id="reader-content"></div>
-          <footer>Leseransicht ${VERSION} · Auswahl aus der geladenen Startseite, keine Sortierung nach Veröffentlichungsdatum.<br>Inhalte und Bilder: Spektrum.de.</footer>
+          <footer>Leseransicht ${VERSION} · Inhalte und Bilder: Spektrum.de.<br>Quelle: <a href="${FEED_PATH}">Spektrum-RSS-Feed</a> · Der Feed enthält die zuletzt bereitgestellten Beiträge und ist kein vollständiges Archiv.</footer>
         </main>
       </div>
 
@@ -617,7 +366,7 @@
     }
     .reader-shell a { color: inherit; text-decoration: none; }
     .reader-shell button { font-family: inherit; }
-    .reader-shell :is(a, button, input):focus-visible, .reader-fab:focus-visible {
+    .reader-shell :is(a, button, select):focus-visible, .reader-fab:focus-visible {
       outline: 2px solid var(--accent, #b51f32);
       outline-offset: 4px;
     }
@@ -683,8 +432,12 @@
     .intro-copy { max-width: 720px; margin: 12px 0 0; color: var(--muted); font-size: 15px; }
     .intro-tools { display: grid; justify-items: end; gap: 12px; }
     .count { color: var(--muted); font-size: 12px; white-space: nowrap; }
-    .section-choice { display: flex; align-items: center; gap: 8px; width: fit-content; margin: 0 0 10px; color: var(--muted); font-size: 12px; cursor: pointer; }
-    .section-choice input { accent-color: var(--accent); }
+    .feed-tools { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 12px; margin-bottom: 12px; }
+    .period-choice { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; }
+    .period-choice select { max-width: 100%; border: 1px solid var(--soft); border-radius: 6px; padding: 7px; background: var(--surface); color: var(--text); font: inherit; }
+    .feed-status { color: var(--muted); font-size: 12px; }
+    .feed-status.is-error { color: var(--accent); }
+    button:disabled { opacity: .5; cursor: wait; }
     .layout-switch { display: flex; padding: 3px; border: 1px solid var(--soft); border-radius: 8px; }
     .layout-switch button {
       border: 0; border-radius: 5px; padding: 6px 10px;
@@ -885,28 +638,36 @@
     requestAnimationFrame(() => window.scrollTo(0, state.originalScroll));
   }
 
-  function refresh(shadow) {
-    const wasActive = state.active;
-    if (wasActive) document.documentElement.classList.remove(ACTIVE_CLASS);
-    state.items = extractItems();
-    if (wasActive) document.documentElement.classList.add(ACTIVE_CLASS);
-
-    state.filter = 'all';
-    state.expanded = false;
-    renderFilters(shadow);
-    renderContent(shadow);
-    scrollToTop();
+  async function refresh(shadow) {
+    if (state.loading) return;
+    state.loading = true;
+    state.error = false;
+    renderFeedStatus(shadow);
+    if (!state.updatedAt) renderContent(shadow);
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 12000);
+    try {
+      const response = await fetch(new URL(FEED_PATH, location.origin), {
+        credentials: 'omit', cache: 'no-cache', signal: controller.signal
+      });
+      if (!response.ok) throw new Error(`RSS HTTP ${response.status}`);
+      state.items = parseFeed(await response.text());
+      state.updatedAt = new Date();
+      state.expanded = false;
+    } catch (error) {
+      state.error = true;
+      console.warn('[Spektrum Leseransicht] RSS konnte nicht geladen werden:', error.message);
+    } finally {
+      clearTimeout(timer);
+      state.loading = false;
+      renderFilters(shadow);
+      renderContent(shadow);
+      renderFeedStatus(shadow);
+    }
   }
 
   function mount() {
     document.getElementById(ROOT_ID)?.remove();
-    state.items = extractItems();
-
-    if (!state.items.length) {
-      console.warn('[Spektrum Leseransicht] Keine redaktionellen Inhalte gefunden.');
-      return;
-    }
-
     installGlobalStyle();
 
     const host = document.createElement('div');
@@ -919,15 +680,15 @@
     shadow.appendChild(style);
 
     const wrapper = document.createElement('div');
-    wrapper.innerHTML = shellHtml(state.items);
+    wrapper.innerHTML = shellHtml();
     while (wrapper.firstChild) shadow.appendChild(wrapper.firstChild);
 
     renderContent(shadow);
     document.documentElement.classList.add(ACTIVE_CLASS);
 
     shadow.addEventListener('change', event => {
-      if (event.target.id !== 'include-sections') return;
-      state.includeSections = event.target.checked;
+      if (event.target.id !== 'period') return;
+      state.days = event.target.value;
       state.expanded = false;
       renderFilters(shadow);
       renderContent(shadow);
@@ -969,19 +730,27 @@
 
       if (event.target.closest('#show-original')) showOriginal(shadow);
       if (event.target.closest('#show-reader')) activateReader(shadow);
-      if (event.target.closest('#refresh')) refresh(shadow);
+      if (event.target.closest('#refresh, #retry-feed')) void refresh(shadow);
     });
 
     document.addEventListener('keydown', event => {
       if (event.key === 'Escape' && state.active) showOriginal(shadow);
     });
 
-    console.info(`[Spektrum Leseransicht] ${state.items.length} redaktionelle Beiträge geladen.`);
+    // Broken publisher images should leave a clean text layout.
+    shadow.addEventListener('error', event => {
+      if (!event.target.matches?.('img')) return;
+      const hero = event.target.closest('.hero');
+      if (hero) hero.classList.add('hero-text');
+      event.target.closest('.hero-image, .visual-image')?.remove();
+    }, true);
+
+    void refresh(shadow);
   }
 
   if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', () => setTimeout(mount, 500), { once: true });
+    document.addEventListener('DOMContentLoaded', mount, { once: true });
   } else {
-    setTimeout(mount, 500);
+    mount();
   }
 })();
