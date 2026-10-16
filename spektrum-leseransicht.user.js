@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Spektrum.de – Leseransicht
 // @namespace    https://github.com/ThisIsBert/Spektrum-Userscripts
-// @version      0.3.0
+// @version      0.4.0
 // @description  Eine ruhige, redaktionelle Spektrum-Startseite – ohne Shop, Abo, Werbung und Verlagspromos.
 // @match        https://www.spektrum.de/
 // @match        https://spektrum.de/
@@ -17,7 +17,13 @@
   const ROOT_ID = 'spektrum-reader-view';
   const GLOBAL_STYLE_ID = 'spektrum-reader-global-style';
   const ACTIVE_CLASS = 'spektrum-reader-active';
-  const INITIAL_OVERVIEW_COUNT = 18;
+  const INITIAL_OVERVIEW_COUNT = 12;
+  const LAYOUT_KEY = 'spektrum-reader-layout';
+
+  function savedLayout() {
+    try { return localStorage.getItem(LAYOUT_KEY) === 'compact' ? 'compact' : 'magazine'; }
+    catch { return 'magazine'; }
+  }
 
   const ALLOWED_TYPES = new Map([
     ['news',      { label: 'Nachricht', plural: 'Nachrichten' }],
@@ -36,6 +42,7 @@
     filter: 'all',
     items: [],
     expanded: false,
+    layout: savedLayout(),
     readerScroll: 0,
     originalScroll: 0
   };
@@ -76,6 +83,7 @@
 
     try {
       const u = new URL(url, location.href);
+      if (!/^https?:$/.test(u.protocol)) return false;
       if (!/(^|\.)spektrum\.de$/i.test(u.hostname)) return false;
       if (u.pathname === '/video/partner' || u.pathname.startsWith('/video/partner/')) return false;
 
@@ -100,11 +108,24 @@
   }
 
   function findCard(anchor) {
-    return anchor.closest('article') ||
-           anchor.closest('li.teaser__line__left') ||
-           anchor.closest('[class*="teaser"]') ||
-           anchor.closest('li') ||
-           anchor.parentElement;
+    // Choose the nearest individual card, never an outer list's heading.
+    return anchor.closest('article, li, .teaser') || anchor.parentElement;
+  }
+
+  function excludedCollections(scope) {
+    const roots = [...scope.querySelectorAll('.kiosk, .product-actions, .advert, .ad-container, .native-ad, .sponsored')];
+    for (const heading of scope.querySelectorAll('h2, h3, h4, [role="heading"]')) {
+      if (!/^(?:meistgelesen|das beste von spektrum\s*\.\s*de)[.!:]?$/i.test(norm(heading.textContent))) continue;
+      // Collection headings sit above their links. Exclude only that occurrence,
+      // so an article also present in the normal news stream is still retained.
+      for (let block = heading.parentElement; block && block !== scope; block = block.parentElement) {
+        if ([...block.querySelectorAll('a[href]')].some(a => isEditorialUrl(a.href))) {
+          roots.push(block);
+          break;
+        }
+      }
+    }
+    return roots;
   }
 
   function cardPriority(card) {
@@ -151,14 +172,15 @@
   }
 
   function extractTitle(card, anchor, kicker) {
-    const titleEl = card?.querySelector([
+    const titleSelector = [
       '.teaser__wide__title',
       '.teaser__grid__title',
       '.teaser__full__title',
       '.teaser__small__heading',
       '.teaser__large__heading',
       'h1', 'h2', 'h3', 'h4'
-    ].join(','));
+    ].join(',');
+    const titleEl = anchor.querySelector(titleSelector) || card?.querySelector(titleSelector);
 
     let title = cleanHeadingText(titleEl);
 
@@ -248,7 +270,14 @@
   }
 
   function extractImage(card) {
-    const images = [...(card?.querySelectorAll('img') || [])]
+    const imageNodes = [...(card?.querySelectorAll('img') || [])];
+    // Lazy images may still live inside noscript when document-idle fires.
+    for (const node of card?.querySelectorAll('noscript') || []) {
+      const template = document.createElement('template');
+      template.innerHTML = node.textContent;
+      imageNodes.push(...template.content.querySelectorAll('img'));
+    }
+    const images = imageNodes
       .map(img => {
         const src = imageUrl(img);
         return { img, src, quality: imageScore(img, src) };
@@ -340,7 +369,9 @@
 
   function extractItems() {
     const scope = document.querySelector('#main') || document.querySelector('main') || document.body;
-    const anchors = [...scope.querySelectorAll('a[href]')].filter(a => isEditorialUrl(a.href));
+    const excluded = excludedCollections(scope);
+    const anchors = [...scope.querySelectorAll('a[href]')]
+      .filter(a => isEditorialUrl(a.href) && !excluded.some(block => block.contains(a)));
     const byUrl = new Map();
 
     anchors.forEach((anchor, order) => {
@@ -354,6 +385,7 @@
 
   function formatMeta(item) {
     const parts = [];
+    if (item.kicker && item.type !== 'news') parts.push(item.typeLabel);
     if (item.kicker) parts.push(item.kicker);
     else parts.push(item.typeLabel);
     if (item.author) parts.push(item.author.replace(/^von\s+/i, 'von '));
@@ -367,12 +399,12 @@
     const teaser = item.teaser ? `<p>${escapeHtml(item.teaser)}</p>` : '';
 
     return `
-      <article class="hero" data-type="${escapeHtml(item.type)}">
+      <article class="hero${item.image ? '' : ' hero-text'}" data-type="${escapeHtml(item.type)}">
         <a href="${escapeHtml(item.url)}">
           ${image}
           <div class="hero-copy">
             <div class="meta">${escapeHtml(formatMeta(item))}</div>
-            <h1>${escapeHtml(item.title)}</h1>
+            <h2>${escapeHtml(item.title)}</h2>
             ${teaser}
             <span class="read-more">Lesen <span aria-hidden="true">→</span></span>
           </div>
@@ -398,8 +430,8 @@
     return `
       <article class="overview-item" data-type="${escapeHtml(item.type)}">
         <a href="${escapeHtml(item.url)}">
-          <div class="overview-meta">${escapeHtml(formatMeta(item))}</div>
           <div class="overview-copy">
+            <div class="overview-meta">${escapeHtml(formatMeta(item))}</div>
             <h3>${escapeHtml(item.title)}</h3>
             ${item.teaser ? `<p>${escapeHtml(item.teaser)}</p>` : ''}
           </div>
@@ -432,13 +464,14 @@
       return;
     }
 
+    const compact = state.layout === 'compact';
     const heroPool = list.some(item => item.image) ? list.filter(item => item.image) : list;
-    const hero = [...heroPool].sort(rankForHero)[0];
-    const remaining = list.filter(item => item.url !== hero.url);
+    const hero = compact ? null : [...heroPool].sort(rankForHero)[0];
+    const remaining = list.filter(item => item.url !== hero?.url);
     const visual = remaining
-      .filter(item => item.image)
+      .filter(item => !compact && item.image)
       .sort((a, b) => (b.priority - a.priority) || (a.order - b.order))
-      .slice(0, 6);
+      .slice(0, 3);
 
     const visualUrls = new Set(visual.map(item => item.url));
     const overview = remaining.filter(item => !visualUrls.has(item.url));
@@ -446,7 +479,7 @@
     const hiddenCount = Math.max(0, overview.length - INITIAL_OVERVIEW_COUNT);
 
     content.innerHTML = `
-      ${heroHtml(hero)}
+      ${hero ? heroHtml(hero) : ''}
 
       ${visual.length ? `
         <section class="visual-section" aria-label="Weitere Themen">
@@ -456,12 +489,12 @@
       ${overview.length ? `
         <section class="overview-section">
           <div class="section-head">
-            <h2>Im Überblick</h2>
-            <span>${overview.length} weitere Beiträge</span>
+            <h2>${compact ? 'Alle Beiträge' : 'Im Überblick'}</h2>
+            <span>${visibleOverview.length} von ${overview.length}</span>
           </div>
-          <div class="overview-list">${visibleOverview.map(overviewItemHtml).join('')}</div>
+          <div id="overview-list" class="overview-list">${visibleOverview.map(overviewItemHtml).join('')}</div>
           ${hiddenCount ? `
-            <button id="toggle-more" class="more-button" type="button">
+            <button id="toggle-more" class="more-button" type="button" aria-expanded="${state.expanded}" aria-controls="overview-list">
               ${state.expanded ? 'Weniger anzeigen' : `${hiddenCount} weitere Beiträge anzeigen`}
             </button>` : ''}
         </section>` : ''}
@@ -475,10 +508,10 @@
     const preferred = ['news', 'kolumne', 'podcast', 'video', 'frage', 'raetsel', 'rezension', 'wissen', 'leseprobe'];
     const buttons = preferred
       .filter(type => counts.has(type))
-      .map(type => `<button class="filter" type="button" data-filter="${type}">${escapeHtml(ALLOWED_TYPES.get(type).plural)} <span>${counts.get(type)}</span></button>`)
+      .map(type => `<button class="filter" type="button" data-filter="${type}" aria-pressed="false">${escapeHtml(ALLOWED_TYPES.get(type).plural)} <span>${counts.get(type)}</span></button>`)
       .join('');
 
-    return `<button class="filter is-active" type="button" data-filter="all">Alle <span>${items.length}</span></button>${buttons}`;
+    return `<button class="filter is-active" type="button" data-filter="all" aria-pressed="true">Alle <span>${items.length}</span></button>${buttons}`;
   }
 
   function shellHtml(items) {
@@ -502,12 +535,17 @@
             <div>
               <p class="eyebrow">Wissenschaft ohne Umwege</p>
               <h1>Was heute lesenswert ist.</h1>
-              <p class="intro-copy">Redaktionelle Inhalte der Spektrum-Startseite – ohne Shop, Abo, Werbung und doppelte Teaser.</p>
+              <p class="intro-copy">Wissenschaft entdecken. In Ruhe lesen.</p>
             </div>
-            <div id="article-count" class="count"></div>
+            <div class="intro-tools">
+              <div id="article-count" class="count" role="status" aria-live="polite" aria-atomic="true"></div>
+              <div class="layout-switch" role="group" aria-label="Darstellung">
+                <button type="button" data-layout="magazine" aria-pressed="${state.layout === 'magazine'}">Magazin</button>
+                <button type="button" data-layout="compact" aria-pressed="${state.layout === 'compact'}">Kompakt</button>
+              </div>
+            </div>
           </div>
-
-          <div class="filters" aria-label="Inhalte filtern">${filterButtons(items)}</div>
+          <nav class="filters" aria-label="Inhalte filtern">${filterButtons(items)}</nav>
           <div id="reader-content"></div>
           <footer>Leseransicht · Inhalte und Bilder stammen aus der geladenen Spektrum-Seite.</footer>
         </main>
@@ -519,6 +557,7 @@
 
   const css = `
     :host { all: initial; display: block; }
+    [hidden] { display: none !important; }
     *, *::before, *::after { box-sizing: border-box; }
     button, a { -webkit-tap-highlight-color: transparent; }
 
@@ -537,7 +576,11 @@
       text-rendering: optimizeLegibility;
     }
     .reader-shell a { color: inherit; text-decoration: none; }
-    .reader-shell button { font: inherit; }
+    .reader-shell button { font-family: inherit; }
+    .reader-shell :is(a, button):focus-visible, .reader-fab:focus-visible {
+      outline: 2px solid var(--accent, #b51f32);
+      outline-offset: 4px;
+    }
 
     .topbar {
       position: sticky;
@@ -565,7 +608,7 @@
     }
     .brand div { display: grid; line-height: 1.05; }
     .brand strong { font-size: 14px; font-weight: 720; }
-    .brand span { margin-top: 4px; color: var(--muted); font-size: 10px; letter-spacing: .09em; text-transform: uppercase; }
+    .brand div span { margin-top: 4px; color: var(--muted); font-size: 10px; letter-spacing: .09em; text-transform: uppercase; }
     .actions { display: flex; align-items: center; gap: 8px; }
     .secondary, .icon-button, .filter, .reader-fab, .more-button {
       border: 1px solid var(--soft);
@@ -583,22 +626,29 @@
     .eyebrow, .meta, .overview-meta {
       margin: 0 0 8px;
       color: var(--accent);
-      font-size: 10px;
-      font-weight: 780;
-      letter-spacing: .095em;
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: .06em;
       text-transform: uppercase;
     }
     .intro h1 {
       margin: 0;
       max-width: 760px;
       font-family: Georgia, "Times New Roman", serif;
-      font-size: clamp(38px, 4.4vw, 62px);
-      line-height: 1.01;
+      font-size: clamp(34px, 4vw, 54px);
+      line-height: 1.08;
       letter-spacing: -.035em;
       font-weight: 700;
     }
-    .intro-copy { max-width: 720px; margin: 15px 0 0; color: var(--muted); font-size: 14px; }
-    .count { color: var(--muted); font-size: 11px; white-space: nowrap; }
+    .intro-copy { max-width: 720px; margin: 12px 0 0; color: var(--muted); font-size: 15px; }
+    .intro-tools { display: grid; justify-items: end; gap: 12px; }
+    .count { color: var(--muted); font-size: 12px; white-space: nowrap; }
+    .layout-switch { display: flex; padding: 3px; border: 1px solid var(--soft); border-radius: 8px; }
+    .layout-switch button {
+      border: 0; border-radius: 5px; padding: 6px 10px;
+      background: transparent; color: var(--muted); cursor: pointer; font-size: 12px;
+    }
+    .layout-switch button[aria-pressed="true"] { background: var(--surface); color: var(--text); box-shadow: 0 1px 3px #0002; }
 
     .filters {
       display: flex;
@@ -612,12 +662,12 @@
     .filters::-webkit-scrollbar { display: none; }
     .filter {
       flex: 0 0 auto;
-      padding: 0 0 6px;
+      padding: 9px 0;
       border: 0;
       border-bottom: 1px solid transparent;
       background: transparent;
       color: var(--muted);
-      font-size: 11px;
+      font-size: 13px;
     }
     .filter span { margin-left: 3px; opacity: .68; }
     .filter:hover { color: var(--text); }
@@ -625,22 +675,23 @@
 
     .hero { margin: 8px 0 42px; }
     .hero > a {
-      min-height: 430px;
+      min-height: 360px;
       display: grid;
       grid-template-columns: minmax(0, 1.45fr) minmax(320px, .78fr);
       overflow: hidden;
       border: 1px solid var(--soft);
       background: var(--surface);
     }
+    .hero-text > a { grid-template-columns: 1fr; min-height: 0; }
     .hero-image { min-height: 100%; background: #deded8; overflow: hidden; }
-    .hero-image img { width: 100%; height: 100%; min-height: 430px; object-fit: cover; display: block; transition: transform .5s ease; }
+    .hero-image img { width: 100%; height: 100%; min-height: 360px; object-fit: cover; display: block; transition: transform .5s ease; }
     .hero > a:hover .hero-image img { transform: scale(1.016); }
-    .hero-copy { display: flex; flex-direction: column; justify-content: center; padding: clamp(28px, 3.6vw, 50px); }
-    .hero-copy h1 {
+    .hero-copy { min-width: 0; overflow-wrap: anywhere; display: flex; flex-direction: column; justify-content: center; padding: clamp(28px, 3.6vw, 50px); }
+    .hero-copy h2 {
       margin: 0;
       font-family: Georgia, "Times New Roman", serif;
-      font-size: clamp(34px, 3.6vw, 52px);
-      line-height: 1.03;
+      font-size: clamp(30px, 3.3vw, 46px);
+      line-height: 1.1;
       letter-spacing: -.035em;
       font-weight: 700;
     }
@@ -657,8 +708,8 @@
     .visual-image img { width: 100%; height: 100%; display: block; object-fit: cover; transition: transform .35s ease; }
     .visual-card a:hover .visual-image img { transform: scale(1.025); }
     .visual-copy { padding-top: 13px; }
-    .visual-copy h2 { margin: 0; font-size: clamp(18px, 1.55vw, 23px); line-height: 1.12; letter-spacing: -.023em; font-weight: 720; text-wrap: balance; }
-    .visual-copy p { margin: 8px 0 0; color: var(--muted); font-size: 13px; line-height: 1.48; }
+    .visual-copy h2 { margin: 0; font-size: clamp(19px, 1.7vw, 23px); line-height: 1.22; letter-spacing: -.02em; font-weight: 720; text-wrap: balance; }
+    .visual-copy p { margin: 8px 0 0; color: var(--muted); font-size: 14px; line-height: 1.55; }
     .visual-card a:hover h2, .overview-item a:hover h3 { text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 4px; }
 
     .overview-section { width: min(940px, 100%); margin: 0 auto; }
@@ -671,26 +722,26 @@
       border-bottom: 1px solid var(--soft);
     }
     .section-head h2 { margin: 0; font-family: Georgia, "Times New Roman", serif; font-size: 27px; line-height: 1.1; }
-    .section-head span { color: var(--muted); font-size: 11px; }
+    .section-head span { color: var(--muted); font-size: 12px; white-space: nowrap; }
     .overview-list { display: block; }
     .overview-item { border-bottom: 1px solid var(--soft); }
     .overview-item a {
-      min-height: 114px;
       display: grid;
-      grid-template-columns: 170px minmax(0, 1fr) 24px;
+      grid-template-columns: minmax(0, 1fr) 24px;
       align-items: center;
       gap: 26px;
-      padding: 20px 0;
+      padding: 19px 0;
     }
-    .overview-meta { margin: 0; line-height: 1.45; }
-    .overview-copy h3 { margin: 0; font-size: 21px; line-height: 1.15; letter-spacing: -.018em; font-weight: 690; }
-    .overview-copy p { margin: 7px 0 0; max-width: 690px; color: var(--muted); font-size: 13px; line-height: 1.48; }
+    .overview-meta { margin: 0 0 6px; line-height: 1.45; }
+    .overview-copy { min-width: 0; overflow-wrap: anywhere; }
+    .overview-copy h3 { margin: 0; font-size: 21px; line-height: 1.25; letter-spacing: -.018em; font-weight: 690; }
+    .overview-copy p { margin: 7px 0 0; max-width: 75ch; color: var(--muted); font-size: 14px; line-height: 1.55; }
     .arrow { color: var(--muted); font-size: 18px; transition: transform .15s ease; }
     .overview-item a:hover .arrow { transform: translateX(4px); color: var(--text); }
 
     .more-button {
       display: block;
-      min-width: 260px;
+      max-width: 100%;
       margin: 28px auto 0;
       border-radius: 999px;
       padding: 11px 18px;
@@ -718,7 +769,7 @@
       .hero-image img { min-height: 0; aspect-ratio: 16/9; }
       .hero-copy { padding: 28px; }
       .visual-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .overview-item a { grid-template-columns: 135px minmax(0, 1fr) 20px; gap: 18px; }
+      .intro { flex-wrap: wrap; gap: 20px; }
     }
 
     @media (max-width: 620px) {
@@ -728,18 +779,20 @@
       .secondary { padding: 8px 10px; }
       .page { padding-top: 32px; }
       .intro { display: block; }
-      .count { margin-top: 12px; }
-      .intro-copy { font-size: 13px; }
+      .intro-tools { display: flex; align-items: center; justify-content: space-between; margin-top: 20px; }
+      .intro-copy { font-size: 14px; }
       .hero { margin-bottom: 34px; }
       .hero-copy { padding: 23px 20px 25px; }
       .visual-grid { grid-template-columns: 1fr; gap: 30px; }
       .visual-section { margin-bottom: 48px; }
       .overview-item a { grid-template-columns: 1fr 18px; gap: 10px; padding: 18px 0; }
-      .overview-meta { grid-column: 1 / -1; margin-bottom: -3px; }
       .overview-copy h3 { font-size: 19px; }
-      .overview-copy p { font-size: 12.5px; }
+      .overview-copy p { font-size: 14px; }
       .section-head h2 { font-size: 24px; }
-      .section-head span { display: none; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; }
     }
 
     @media (prefers-color-scheme: dark) {
@@ -777,6 +830,10 @@
     requestAnimationFrame(() => window.scrollTo(0, state.readerScroll));
   }
 
+  function scrollToTop() {
+    window.scrollTo({ top: 0, behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth' });
+  }
+
   function showOriginal(shadow) {
     state.active = false;
     state.readerScroll = window.scrollY;
@@ -796,7 +853,7 @@
     state.expanded = false;
     shadow.querySelector('.filters').innerHTML = filterButtons(state.items);
     renderContent(shadow);
-    window.scrollTo({ top: 0, behavior: 'smooth' });
+    scrollToTop();
   }
 
   function mount() {
@@ -831,9 +888,23 @@
       if (filter) {
         state.filter = filter.dataset.filter || 'all';
         state.expanded = false;
-        shadow.querySelectorAll('.filter').forEach(btn => btn.classList.toggle('is-active', btn === filter));
+        shadow.querySelectorAll('.filter').forEach(btn => {
+          btn.classList.toggle('is-active', btn === filter);
+          btn.setAttribute('aria-pressed', String(btn === filter));
+        });
         renderContent(shadow);
-        window.scrollTo({ top: 0, behavior: 'smooth' });
+        scrollToTop();
+        return;
+      }
+
+      const layout = event.target.closest('[data-layout]');
+      if (layout) {
+        state.layout = layout.dataset.layout;
+        state.expanded = false;
+        try { localStorage.setItem(LAYOUT_KEY, state.layout); } catch { /* Storage may be blocked. */ }
+        shadow.querySelectorAll('[data-layout]').forEach(btn => btn.setAttribute('aria-pressed', String(btn === layout)));
+        renderContent(shadow);
+        scrollToTop();
         return;
       }
 
@@ -841,7 +912,8 @@
         state.expanded = !state.expanded;
         const sectionTop = shadow.querySelector('.overview-section')?.getBoundingClientRect().top + window.scrollY;
         renderContent(shadow);
-        if (!state.expanded && Number.isFinite(sectionTop)) window.scrollTo({ top: sectionTop - 82, behavior: 'smooth' });
+        shadow.querySelector('#toggle-more')?.focus({ preventScroll: true });
+        if (!state.expanded && Number.isFinite(sectionTop)) window.scrollTo({ top: sectionTop - 82, behavior: 'instant' });
         return;
       }
 
