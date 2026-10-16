@@ -1,7 +1,9 @@
 // ==UserScript==
 // @name         Spektrum.de – Leseransicht
 // @namespace    https://github.com/ThisIsBert/Spektrum-Userscripts
-// @version      0.4.0
+// @version      0.4.1
+// @downloadURL  https://raw.githubusercontent.com/ThisIsBert/Test_LAnsicht/main/spektrum-leseransicht.user.js
+// @updateURL    https://raw.githubusercontent.com/ThisIsBert/Test_LAnsicht/main/spektrum-leseransicht.user.js
 // @description  Eine ruhige, redaktionelle Spektrum-Startseite – ohne Shop, Abo, Werbung und Verlagspromos.
 // @match        https://www.spektrum.de/
 // @match        https://spektrum.de/
@@ -17,6 +19,7 @@
   const ROOT_ID = 'spektrum-reader-view';
   const GLOBAL_STYLE_ID = 'spektrum-reader-global-style';
   const ACTIVE_CLASS = 'spektrum-reader-active';
+  const VERSION = '0.4.1';
   const INITIAL_OVERVIEW_COUNT = 12;
   const LAYOUT_KEY = 'spektrum-reader-layout';
 
@@ -43,6 +46,7 @@
     items: [],
     expanded: false,
     layout: savedLayout(),
+    includeSections: false,
     readerScroll: 0,
     originalScroll: 0
   };
@@ -110,6 +114,22 @@
   function findCard(anchor) {
     // Choose the nearest individual card, never an outer list's heading.
     return anchor.closest('article, li, .teaser') || anchor.parentElement;
+  }
+
+  function isRecommendationLink(anchor) {
+    // Read tracking before canonicalUrl removes it. These markers are also
+    // available when a carousel is moved or its heading has not loaded yet.
+    try {
+      const campaign = new URL(anchor.href).searchParams.get('itm_campaign') || '';
+      return /^(?:meistgelesen|articles-of-interest)$/i.test(campaign);
+    } catch { return false; }
+  }
+
+  function currentSectionEnd(scope) {
+    // The main editorial stream precedes the named magazine/topic sections.
+    // Sidebar headings such as Meistgelesen must not terminate that stream.
+    return [...scope.querySelectorAll('.teaser-area, .teaser-category')]
+      .find(node => !node.closest('aside, article') && norm(node.textContent)) || null;
   }
 
   function excludedCollections(scope) {
@@ -346,13 +366,14 @@
     if (!oldItem) return newItem;
 
     const richness = item => item.priority + (item.image ? 25 : 0) + (item.teaser ? 8 : 0) + (item.author ? 2 : 0);
-    const newWins = richness(newItem) > richness(oldItem);
+    const newWins = oldItem.current !== newItem.current ? newItem.current : richness(newItem) > richness(oldItem);
     const base = { ...(newWins ? newItem : oldItem) };
     const other = newWins ? oldItem : newItem;
 
     base.order = Math.min(oldItem.order, newItem.order);
     base.priority = Math.max(oldItem.priority, newItem.priority);
     base.featured = oldItem.featured || newItem.featured;
+    base.current = oldItem.current || newItem.current;
     base.kicker ||= other.kicker;
     base.author ||= other.author;
 
@@ -370,13 +391,15 @@
   function extractItems() {
     const scope = document.querySelector('#main') || document.querySelector('main') || document.body;
     const excluded = excludedCollections(scope);
+    const sectionEnd = currentSectionEnd(scope);
     const anchors = [...scope.querySelectorAll('a[href]')]
-      .filter(a => isEditorialUrl(a.href) && !excluded.some(block => block.contains(a)));
+      .filter(a => isEditorialUrl(a.href) && !isRecommendationLink(a) && !excluded.some(block => block.contains(a)));
     const byUrl = new Map();
 
     anchors.forEach((anchor, order) => {
       const candidate = candidateFrom(anchor, order);
       if (!candidate) return;
+      candidate.current = !sectionEnd || Boolean(anchor.compareDocumentPosition(sectionEnd) & Node.DOCUMENT_POSITION_FOLLOWING);
       byUrl.set(candidate.url, mergeCandidate(byUrl.get(candidate.url), candidate));
     });
 
@@ -441,8 +464,24 @@
   }
 
   function currentItems() {
-    if (state.filter === 'all') return state.items;
-    return state.items.filter(item => item.type === state.filter);
+    return availableItems().filter(item => state.filter === 'all' || item.type === state.filter);
+  }
+
+  function availableItems() {
+    return state.includeSections ? state.items : state.items.filter(item => item.current);
+  }
+
+  function renderFilters(shadow) {
+    const items = availableItems();
+    if (state.filter !== 'all' && !items.some(item => item.type === state.filter)) state.filter = 'all';
+    shadow.querySelector('.filters').innerHTML = filterButtons(items);
+    shadow.querySelectorAll('.filter').forEach(btn => {
+      const active = btn.dataset.filter === state.filter;
+      btn.classList.toggle('is-active', active);
+      btn.setAttribute('aria-pressed', String(active));
+    });
+    shadow.querySelector('#selection-note').textContent = state.includeSections
+      ? 'Beiträge aus allen redaktionellen Rubriken.' : 'Der aktuelle Überblick der Startseite.';
   }
 
   function rankForHero(a, b) {
@@ -521,7 +560,7 @@
           <div class="topbar-inner">
             <div class="brand">
               <span class="brand-mark">S</span>
-              <div><strong>Spektrum</strong><span>Leseransicht</span></div>
+              <div><strong>Spektrum</strong><span>Leseransicht · ${VERSION}</span></div>
             </div>
             <nav class="actions" aria-label="Ansicht">
               <button id="refresh" class="icon-button" type="button" title="Inhalte neu einlesen" aria-label="Inhalte neu einlesen">↻</button>
@@ -535,7 +574,7 @@
             <div>
               <p class="eyebrow">Wissenschaft ohne Umwege</p>
               <h1>Was heute lesenswert ist.</h1>
-              <p class="intro-copy">Wissenschaft entdecken. In Ruhe lesen.</p>
+              <p class="intro-copy" id="selection-note">Der aktuelle Überblick der Startseite.</p>
             </div>
             <div class="intro-tools">
               <div id="article-count" class="count" role="status" aria-live="polite" aria-atomic="true"></div>
@@ -545,9 +584,10 @@
               </div>
             </div>
           </div>
-          <nav class="filters" aria-label="Inhalte filtern">${filterButtons(items)}</nav>
+          <label class="section-choice"><input id="include-sections" type="checkbox"> Weitere Rubriken einbeziehen</label>
+          <nav class="filters" aria-label="Inhalte filtern">${filterButtons(items.filter(item => item.current))}</nav>
           <div id="reader-content"></div>
-          <footer>Leseransicht · Inhalte und Bilder stammen aus der geladenen Spektrum-Seite.</footer>
+          <footer>Leseransicht ${VERSION} · Auswahl aus der geladenen Startseite, keine Sortierung nach Veröffentlichungsdatum.<br>Inhalte und Bilder: Spektrum.de.</footer>
         </main>
       </div>
 
@@ -577,7 +617,7 @@
     }
     .reader-shell a { color: inherit; text-decoration: none; }
     .reader-shell button { font-family: inherit; }
-    .reader-shell :is(a, button):focus-visible, .reader-fab:focus-visible {
+    .reader-shell :is(a, button, input):focus-visible, .reader-fab:focus-visible {
       outline: 2px solid var(--accent, #b51f32);
       outline-offset: 4px;
     }
@@ -643,6 +683,8 @@
     .intro-copy { max-width: 720px; margin: 12px 0 0; color: var(--muted); font-size: 15px; }
     .intro-tools { display: grid; justify-items: end; gap: 12px; }
     .count { color: var(--muted); font-size: 12px; white-space: nowrap; }
+    .section-choice { display: flex; align-items: center; gap: 8px; width: fit-content; margin: 0 0 10px; color: var(--muted); font-size: 12px; cursor: pointer; }
+    .section-choice input { accent-color: var(--accent); }
     .layout-switch { display: flex; padding: 3px; border: 1px solid var(--soft); border-radius: 8px; }
     .layout-switch button {
       border: 0; border-radius: 5px; padding: 6px 10px;
@@ -851,7 +893,7 @@
 
     state.filter = 'all';
     state.expanded = false;
-    shadow.querySelector('.filters').innerHTML = filterButtons(state.items);
+    renderFilters(shadow);
     renderContent(shadow);
     scrollToTop();
   }
@@ -882,6 +924,14 @@
 
     renderContent(shadow);
     document.documentElement.classList.add(ACTIVE_CLASS);
+
+    shadow.addEventListener('change', event => {
+      if (event.target.id !== 'include-sections') return;
+      state.includeSections = event.target.checked;
+      state.expanded = false;
+      renderFilters(shadow);
+      renderContent(shadow);
+    });
 
     shadow.addEventListener('click', event => {
       const filter = event.target.closest('.filter');

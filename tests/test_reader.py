@@ -28,6 +28,12 @@ def homepage():
         <div><ol><li><a href="/news/test/90000">Beliebter älterer Artikel</a></li>
         <li><a href="/news/test/10000">Veralteter Titel aus der Bestenliste</a></li></ol></div>
       </aside></div></div>
+      <div class="sponsored">{article(90002, 'Gesponserter Beitrag')}</div>
+      {''.join(article(11000 + i, image=i < 6) for i in range(25))}
+      {''.join(article(12000 + i, kind=kind) for i, kind in enumerate(['kolumne', 'podcast', 'video', 'raetsel', 'frage', 'rezension', 'leseprobe', 'wissen']))}
+      <a href="/podcast/">Alle Podcasts</a>
+      <article><a href="/video/partner/test/90003"><h3>Partnerinhalt ausschließen</h3></a></article>
+      <article><a href="https://example.com/news/test/90004"><h3>Fremde Domain ausschließen</h3></a></article>
       <div class="row"><div class="columns medium-12">
         <div class="teaser-area"><h3>Das Beste von Spektrum.de</h3></div>
         <div class="swiper"><div class="shuffle-teaser">
@@ -35,12 +41,6 @@ def homepage():
           {article(10000, 'Anderer Titel im Best-of', image=True)}
         </div></div>
       </div></div>
-      <div class="sponsored">{article(90002, 'Gesponserter Beitrag')}</div>
-      {''.join(article(11000 + i, image=i < 6) for i in range(25))}
-      {''.join(article(12000 + i, kind=kind) for i, kind in enumerate(['kolumne', 'podcast', 'video', 'raetsel', 'frage', 'rezension', 'leseprobe', 'wissen']))}
-      <a href="/podcast/">Alle Podcasts</a>
-      <article><a href="/video/partner/test/90003"><h3>Partnerinhalt ausschließen</h3></a></article>
-      <article><a href="https://example.com/news/test/90004"><h3>Fremde Domain ausschließen</h3></a></article>
     </main>'''
 
 
@@ -106,6 +106,45 @@ class ReaderTests(unittest.TestCase):
         self.assertIn('Der zweite richtige Artikeltitel', titles)
         self.assertNotIn('Weitere Nachrichten', titles)
         self.assertEqual(self.reader.locator('.hero > a').evaluate('(el) => getComputedStyle(el).gridTemplateColumns').count(' '), 0)
+
+    def test_reported_recommendation_links_are_excluded_without_headings(self):
+        # URLs and campaign names from the user's DOM report of 2026-10-16.
+        # Deliberately omit collection headings to exercise the independent guard.
+        self.markup = f'''<main>{article(10000)}{article(10001)}
+          <article class="swiper-slide teaser teaser__grid"><a href="https://www.spektrum.de/news/kann-ki-die-relativitaetstheorie-neu-entdecken/2345370?itm_source=homebox&amp;itm_medium=empfehlung&amp;itm_campaign=articles-of-interest">
+          <h3 class="teaser__grid__title">Die Relativitätstheorie als Härtetest für die KI</h3></a></article>
+          <aside class="teaser teaser__list_box"><ol><li><a href="https://www.spektrum.de/news/polwanderung-als-die-erde-kippte/2349591?itm_source=homebox&amp;itm_medium=empfehlung&amp;itm_campaign=meistgelesen">Polwanderung | Als die Erde kippte</a></li></ol></aside>
+          <a href="/news/test/10000?itm_campaign=articles-of-interest">Doppelte Empfehlung eines aktuellen Artikels</a>
+          </main>'''
+        self.load()
+        expect(self.reader.locator('#article-count')).to_have_text('2 Beiträge')
+        self.reader.locator('[data-filter="news"]').click()
+        expect(self.reader.locator('#reader-content article')).to_have_count(2)
+        expect(self.reader.locator('#reader-content a[href*="2345370"], #reader-content a[href*="2349591"]')).to_have_count(0)
+        expect(self.reader.locator('#reader-content a[href$="/10000"]')).to_have_count(1)
+
+    def test_news_filter_defaults_to_current_area_and_other_sections_are_opt_in(self):
+        self.markup = f'''<main id="main">{article(10000)}{article(10001, kind='kolumne')}
+          <section><h3 class="teaser-category">Podcasts</h3>{article(10002, kind='podcast')}</section>
+          <section><div class="teaser-area"><h3>Astronomie</h3></div>
+            {article(10003, 'Ein älterer Artikel aus einer Themenrubrik')}
+            {article(10000, 'Doppelte Platzierung im Themenblock', image=True)}</section></main>'''
+        self.load()
+        expect(self.reader.locator('#article-count')).to_have_text('2 Beiträge')
+        expect(self.reader.locator('footer')).to_contain_text('0.4.1')
+        self.reader.locator('[data-filter="news"]').click()
+        expect(self.reader.locator('#article-count')).to_have_text('1 Beitrag')
+        expect(self.reader.locator('#reader-content article')).to_have_attribute('data-type', 'news')
+        expect(self.reader.locator('#reader-content h2')).to_have_text('Neues aus der Forschung 10000')
+        self.reader.locator('#include-sections').check()
+        expect(self.reader.locator('#article-count')).to_have_text('2 Beiträge')
+        expect(self.reader.locator('[data-filter="news"]')).to_have_attribute('aria-pressed', 'true')
+        self.assertEqual(set(self.reader.locator('#reader-content article').evaluate_all('(els) => els.map(el => el.dataset.type)')), {'news'})
+        self.reader.locator('#include-sections').uncheck()
+        expect(self.reader.locator('#article-count')).to_have_text('1 Beitrag')
+        self.reader.locator('#refresh').click()
+        expect(self.reader.locator('#article-count')).to_have_text('2 Beiträge')
+        expect(self.reader.locator('[data-filter="podcast"]')).to_have_count(0)
 
     def test_compact_layout_filters_and_preference_survive_reload(self):
         self.load()
