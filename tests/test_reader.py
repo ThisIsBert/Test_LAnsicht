@@ -13,9 +13,19 @@ FEED_PATH = '/alias/rss/spektrum-de-rss-feed/996406'
 NOW = datetime(2026, 10, 16, 12, tzinfo=timezone.utc)
 SVG = '<svg xmlns="http://www.w3.org/2000/svg" width="640" height="360"><rect width="640" height="360" fill="steelblue"/></svg>'
 HOMEPAGE = '''<!doctype html><html lang="de"><meta charset="utf-8"><body>
-  <main id="main"><h2>Meistgelesen</h2><article><a href="/news/alt/2345370">
-  <h3>Die Relativitätstheorie als Härtetest für die KI</h3></a></article>
-  <aside>Anzeige und Shop</aside></main></body></html>'''
+  <main id="main"><aside class="teaser"><h2>Meistgelesen</h2><ol><li>
+  <a href="/news/alt/2349591?itm_campaign=meistgelesen">Beliebte ältere Nachricht</a></li></ol></aside>
+  <section><h2>Das Beste von Spektrum.de</h2><article><a href="/news/alt/2345370?itm_campaign=articles-of-interest">
+  <h3>Die Relativitätstheorie als Härtetest für die KI</h3></a></article></section>
+  <aside class="sponsored">Anzeige und Shop</aside></main></body></html>'''
+
+
+def page_article(number, kind='news', title=None, date='', slug='test', image=False):
+    picture = '<noscript><img src="https://static.spektrum.de/test-image.svg" alt="Bild der Startseite" width="640" height="360"></noscript>' if image else ''
+    time = f'<time datetime="{date}">Datum</time>' if date else ''
+    return f'''<article class="teaser teaser__small"><a href="/{kind}/{slug}/{number}?utm_source=homepage">
+      <h3 class="teaser__small__heading"><span class="teaser__small__heading__kicker">Thema</span><span class="show-for-sr">: </span>{html.escape(title or f'Webseitenbeitrag {number}')}</h3>
+      <p>Vorspann von der Startseite.</p>{picture}{time}</a></article>'''
 
 
 def entry(number, hours=0, kind='news', **kwargs):
@@ -58,6 +68,7 @@ class ReaderTests(unittest.TestCase):
         self.page.on('pageerror', lambda error: self.errors.append(str(error)))
         self.items = [entry(10002, hours=4), entry(10003, hours=1, kind='podcast'), entry(10001, hours=0, image=False), entry(10004, hours=100), entry(10005, hours=2, kind='kolumne')]
         self.feed_body = None
+        self.homepage = HOMEPAGE
         self.feed_status = 200
         self.requests = []
         self.pending = []
@@ -71,7 +82,7 @@ class ReaderTests(unittest.TestCase):
                 else:
                     request.fulfill(status=self.feed_status, content_type='application/rss+xml', body=self.feed_body if self.feed_body is not None else feed(self.items))
             elif request.request.resource_type == 'document':
-                request.fulfill(content_type='text/html', body=HOMEPAGE)
+                request.fulfill(content_type='text/html', body=self.homepage)
             elif request.request.url.endswith('test-image.svg'):
                 request.fulfill(content_type='image/svg+xml', body=SVG)
             else:
@@ -108,12 +119,13 @@ class ReaderTests(unittest.TestCase):
     def test_period_handles_old_and_unknown_dates(self):
         self.items += [entry(10006, hours=72), entry(10007, hours=None), entry(10008, hours=-12)]
         self.load()
-        expect(self.reader.locator('#article-count')).to_have_text('3 Beiträge')
-        self.reader.locator('#period').select_option('7')
         expect(self.reader.locator('#article-count')).to_have_text('4 Beiträge')
+        self.reader.locator('#period').select_option('7')
+        expect(self.reader.locator('#article-count')).to_have_text('5 Beiträge')
         self.reader.locator('#period').select_option('all')
         expect(self.reader.locator('#article-count')).to_have_text('6 Beiträge')
         expect(self.reader.locator('#reader-content')).to_contain_text('Datum unbekannt')
+        expect(self.reader.locator('#undated-section')).to_be_visible()
         self.assertTrue(self.all_visible_links()[-1].endswith('/10007'))
         self.assertEqual(len(self.requests), 1)  # Filtering does not refetch.
 
@@ -231,6 +243,66 @@ class ReaderTests(unittest.TestCase):
         expect(self.reader).to_have_count(0)
         expect(self.page.locator('#main')).to_be_visible()
         self.assertEqual(self.requests, [])
+
+    def test_all_homepage_columns_survive_limited_feed_and_are_deduplicated(self):
+        self.homepage = '<main id="main">' + ''.join(page_article(20000 + i, kind='kolumne', image=i == 0) for i in range(8)) + '</main>'
+        self.items = [entry(20000, kind='kolumne', image=False, url=HOME + 'kolumne/anderer-slug/20000')]
+        self.load()
+        self.reader.locator('[data-filter="kolumne"]').click()
+        expect(self.reader.locator('#article-count')).to_have_text('8 Beiträge')
+        expect(self.reader.locator('.hero h2')).to_have_text('Webseitenbeitrag 20000')
+        expect(self.reader.locator('.hero time')).to_have_attribute('datetime', NOW.isoformat(timespec='milliseconds').replace('+00:00', 'Z'))
+        expect(self.reader.locator('.hero img')).to_have_attribute('alt', 'Bild der Startseite')
+        expect(self.reader.locator('#undated-section article')).to_have_count(7)
+        expect(self.reader.locator('#undated-section time')).to_have_count(0)
+        expect(self.reader.locator('#undated-section')).to_contain_text('unabhängig vom gewählten Zeitraum')
+        self.reader.locator('#period').select_option('7')
+        expect(self.reader.locator('#article-count')).to_have_text('8 Beiträge')
+        self.assertEqual(len(set(self.all_visible_links())), 8)
+
+    def test_webpage_survives_feed_failure_and_accepts_explicit_publication_dates(self):
+        self.homepage = '<main id="main">' + page_article(20000) + page_article(20001, date=NOW.isoformat()) + '</main>'
+        self.feed_status = 503
+        self.load()
+        expect(self.reader.locator('#article-count')).to_have_text('2 Beiträge')
+        expect(self.reader.locator('.hero h2')).to_have_text('Webseitenbeitrag 20001')
+        expect(self.reader.locator('#undated-section article')).to_have_count(1)
+        expect(self.reader.locator('#feed-status')).to_contain_text('ohne RSS-Ergänzung')
+        self.reader.locator('#show-original').click()
+        self.page.locator('#main').evaluate('(node, markup) => node.insertAdjacentHTML("beforeend", markup)', page_article(20002))
+        self.reader.locator('#show-reader').click()
+        self.reader.locator('#refresh').click()
+        expect(self.reader.locator('#article-count')).to_have_text('3 Beiträge')
+
+    def test_recommendations_and_sponsors_never_leak_from_page(self):
+        self.items = []
+        self.homepage = '<main id="main">' + page_article(20000, kind='kolumne')
+        self.homepage += '<section><div><h3>Das Beste von Spektrum.de</h3></div>' + page_article(20001, kind='kolumne') + '</section>'
+        self.homepage += '<aside><h3>Meistgelesen</h3><ul><li><a href="/news/test/20002">Meistgelesener Beitrag</a></li></ul></aside>'
+        self.homepage += '<section class="sponsored">' + page_article(20003) + '</section>'
+        self.homepage += '<article><a href="/news/test/20004?itm_campaign=articles-of-interest"><h3>Empfehlung ohne Überschrift</h3></a></article>'
+        self.homepage += page_article(20000, kind='kolumne') + '</main>'
+        self.load()
+        self.reader.locator('[data-filter="kolumne"]').click()
+        expect(self.reader.locator('#article-count')).to_have_text('1 Beitrag')
+        expect(self.reader.locator('#undated-section article')).to_have_count(1)
+        expect(self.reader.locator('.hero')).to_have_count(0)
+        self.reader.locator('[data-filter="all"]').click()
+        expect(self.reader.locator('#article-count')).to_have_text('1 Beitrag')
+
+    def test_undated_overview_has_independent_expansion(self):
+        self.homepage = '<main id="main">' + ''.join(page_article(20000 + i) for i in range(15)) + '</main>'
+        self.items = [entry(10000)]
+        self.load()
+        expect(self.reader.locator('#article-count')).to_have_text('16 Beiträge')
+        expect(self.reader.locator('#undated-section article')).to_have_count(12)
+        self.reader.locator('#toggle-undated').focus()
+        self.page.keyboard.press('Enter')
+        expect(self.reader.locator('#toggle-undated')).to_be_focused()
+        expect(self.reader.locator('#toggle-undated')).to_have_attribute('aria-expanded', 'true')
+        expect(self.reader.locator('#undated-section article')).to_have_count(15)
+        self.page.keyboard.press('Enter')
+        expect(self.reader.locator('#undated-section article')).to_have_count(12)
 
 
 if __name__ == '__main__':

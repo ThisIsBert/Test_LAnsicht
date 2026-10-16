@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Spektrum.de – Leseransicht
 // @namespace    https://github.com/ThisIsBert/Spektrum-Userscripts
-// @version      0.5.0
+// @version      0.6.0
 // @downloadURL  https://raw.githubusercontent.com/ThisIsBert/Test_LAnsicht/main/spektrum-leseransicht.user.js
 // @updateURL    https://raw.githubusercontent.com/ThisIsBert/Test_LAnsicht/main/spektrum-leseransicht.user.js
 // @description  Eine ruhige, redaktionelle Spektrum-Startseite – ohne Shop, Abo, Werbung und Verlagspromos.
@@ -19,7 +19,7 @@
   const ROOT_ID = 'spektrum-reader-view';
   const GLOBAL_STYLE_ID = 'spektrum-reader-global-style';
   const ACTIVE_CLASS = 'spektrum-reader-active';
-  const VERSION = '0.5.0';
+  const VERSION = '0.6.0';
   const FEED_PATH = '/alias/rss/spektrum-de-rss-feed/996406';
   const INITIAL_OVERVIEW_COUNT = 12;
   const LAYOUT_KEY = 'spektrum-reader-layout';
@@ -45,7 +45,10 @@
     active: true,
     filter: 'news',
     items: [],
+    pageItems: [],
+    feedItems: [],
     expanded: false,
+    undatedExpanded: false,
     layout: savedLayout(),
     days: '3',
     loading: false,
@@ -108,18 +111,114 @@
     return norm(template.content.textContent);
   }
 
+  function articleKey(url) {
+    const parsed = new URL(url, location.href);
+    return `${parsed.hostname.replace(/^www\./, '')}:${parsed.pathname.split('/').filter(Boolean).at(-1)}`;
+  }
+
+  function publisherImage(value, alt = '') {
+    if (!value) return null;
+    try {
+      const url = new URL(value, location.href);
+      if (!/^https?:$/.test(url.protocol) || !/(^|\.)spektrum\.de$/i.test(url.hostname)) return null;
+      return { src: url.href, alt: norm(alt) };
+    } catch { return null; }
+  }
+
+  function excludedPageBlocks(scope) {
+    const excluded = [...scope.querySelectorAll('.kiosk, [class*="kiosk__"], .product-actions, .advert, .ad-container, .native-ad, .sponsored')];
+    for (const heading of scope.querySelectorAll('h2, h3, h4, [role="heading"]')) {
+      if (!/^(?:meistgelesen|das beste von spektrum\s*\.\s*de|(?:sponsored\s*)?partnerinhalte?|werbung|anzeige|topseller)[.!:]?$/i.test(norm(heading.textContent))) continue;
+      for (let block = heading.parentElement; block && block !== scope; block = block.parentElement) {
+        if ([...block.querySelectorAll('a[href]')].some(a => isEditorialUrl(a.href))) {
+          excluded.push(block);
+          break;
+        }
+      }
+    }
+    return excluded;
+  }
+
+  function pageImage(card) {
+    const images = [...card.querySelectorAll('img')].filter(img => !img.closest('.author-img-wrap'));
+    for (const node of card.querySelectorAll('noscript')) {
+      if (node.closest('.author-img-wrap')) continue;
+      const template = document.createElement('template');
+      template.innerHTML = node.textContent;
+      images.push(...template.content.querySelectorAll('img'));
+    }
+    return images.filter(img => !img.matches('.image__author') && !/avatar|logo|icon/i.test(img.className))
+      .map(img => {
+        const srcset = img.getAttribute('data-srcset') || img.getAttribute('srcset') || '';
+        const largest = srcset.split(',').map(part => part.trim().split(/\s+/))
+          .sort((a, b) => (parseFloat(b[1]) || 0) - (parseFloat(a[1]) || 0))[0]?.[0];
+        const value = img.getAttribute('data-src') || img.getAttribute('data-lazy-src') || largest || img.getAttribute('src');
+        const image = publisherImage(value, img.getAttribute('alt') || '');
+        const dimensions = image?.src.match(/(?:f|[?&]f=)(\d+)x(\d+)/);
+        const quality = (Number(dimensions?.[1]) * Number(dimensions?.[2])) || (img.width * img.height) || 1;
+        return { image, quality };
+      }).filter(item => item.image).sort((a, b) => b.quality - a.quality)[0]?.image || null;
+  }
+
+  function extractPageItems() {
+    const scope = document.querySelector('#main') || document.querySelector('main');
+    if (!scope) return [];
+    const excluded = excludedPageBlocks(scope);
+    const byId = new Map();
+    for (const anchor of scope.querySelectorAll('a[href]')) {
+      if (!isEditorialUrl(anchor.href) || anchor.closest('nav') || excluded.some(block => block.contains(anchor))) continue;
+      const campaign = new URL(anchor.href).searchParams.get('itm_campaign') || '';
+      if (/^(?:meistgelesen|articles-of-interest)$/i.test(campaign)) continue;
+      const card = anchor.closest('article, li, .teaser');
+      if (!card) continue;
+      const headingSelector = '[class*="__title"], [class*="__heading"], h1, h2, h3, h4';
+      const heading = anchor.querySelector(headingSelector) || card.querySelector(headingSelector);
+      const clone = heading?.cloneNode(true);
+      clone?.querySelectorAll('[class*="kicker"], .show-for-sr').forEach(node => node.remove());
+      const title = norm(clone?.textContent || anchor.textContent);
+      if (!title || /^(?:meistgelesen|das beste von spektrum\.de|anzeige|werbung|sponsored)$/i.test(title)) continue;
+      const url = canonicalUrl(anchor.href);
+      const type = getType(url);
+      const dateNode = card.querySelector('[itemprop="datePublished"], time[datetime]:not([itemprop="dateModified"])');
+      const date = Date.parse(dateNode?.getAttribute('content') || dateNode?.getAttribute('datetime') || '');
+      const entry = {
+        url, type, title, typeLabel: ALLOWED_TYPES.get(type).label,
+        teaser: norm(card.querySelector('[class*="__text"], p')?.textContent),
+        image: pageImage(card), publishedAt: Number.isFinite(date) ? date : null,
+        author: norm(card.querySelector('[class*="__author"]')?.textContent).replace(/^von\s+/i, ''),
+        fromPage: true, fromFeed: false
+      };
+      const key = articleKey(url);
+      const previous = byId.get(key);
+      byId.set(key, previous ? {
+        ...previous, image: previous.image || entry.image, teaser: previous.teaser || entry.teaser,
+        author: previous.author || entry.author, publishedAt: previous.publishedAt ?? entry.publishedAt
+      } : entry);
+    }
+    return [...byId.values()];
+  }
+
+  function mergeSources() {
+    const byId = new Map(state.pageItems.map(item => [articleKey(item.url), item]));
+    for (const feed of state.feedItems) {
+      const key = articleKey(feed.url);
+      const page = byId.get(key);
+      byId.set(key, page ? {
+        ...feed, title: page.title || feed.title, image: page.image || feed.image,
+        teaser: feed.teaser || page.teaser, author: feed.author || page.author,
+        publishedAt: feed.publishedAt ?? page.publishedAt, fromPage: true
+      } : feed);
+    }
+    state.items = [...byId.values()].sort((a, b) => (b.publishedAt ?? -Infinity) - (a.publishedAt ?? -Infinity));
+  }
+
   function feedImage(item) {
     const media = [...item.getElementsByTagNameNS('http://search.yahoo.com/mrss/', 'content')]
       .find(node => node.getAttribute('medium') === 'image' || /^image\//i.test(node.getAttribute('type') || ''));
     const enclosure = [...item.querySelectorAll('enclosure')]
       .find(node => /^image\//i.test(node.getAttribute('type') || ''));
     const value = media?.getAttribute('url') || enclosure?.getAttribute('url');
-    if (!value) return null;
-    try {
-      const url = new URL(value, location.href);
-      if (!/^https?:$/.test(url.protocol) || !/(^|\.)spektrum\.de$/i.test(url.hostname)) return null;
-      return { src: url.href, alt: '' };
-    } catch { return null; }
+    return publisherImage(value);
   }
 
   function parseFeed(text) {
@@ -141,12 +240,13 @@
       const entry = {
         url, type, title, typeLabel: ALLOWED_TYPES.get(type).label,
         teaser: plainText(item.querySelector('description')?.textContent),
-        image: feedImage(item), author, publishedAt
+        image: feedImage(item), author, publishedAt, fromFeed: true, fromPage: false
       };
-      const previous = byUrl.get(url);
-      if (!previous || (publishedAt ?? -Infinity) > (previous.publishedAt ?? -Infinity)) byUrl.set(url, entry);
+      const key = articleKey(url);
+      const previous = byUrl.get(key);
+      if (!previous || (publishedAt ?? -Infinity) > (previous.publishedAt ?? -Infinity)) byUrl.set(key, entry);
     }
-    // Stable chronological order; missing dates remain visible only under "all".
+    // Stable chronological order; undated items keep their source order.
     return [...byUrl.values()].sort((a, b) => (b.publishedAt ?? -Infinity) - (a.publishedAt ?? -Infinity));
   }
 
@@ -218,7 +318,7 @@
     if (state.days === 'all') return state.items;
     const now = Date.now();
     const cutoff = now - Number(state.days) * 86400000;
-    return state.items.filter(item => item.publishedAt !== null && item.publishedAt >= cutoff && item.publishedAt <= now);
+    return state.items.filter(item => item.publishedAt === null || (item.publishedAt >= cutoff && item.publishedAt <= now));
   }
 
   function renderFilters(shadow) {
@@ -229,25 +329,44 @@
     const status = shadow.querySelector('#feed-status');
     status.classList.toggle('is-error', state.error);
     status.setAttribute('role', state.error ? 'alert' : 'status');
-    status.textContent = state.loading ? 'Beiträge werden geladen …'
-      : state.error ? (state.updatedAt ? 'Aktualisierung fehlgeschlagen. Die zuletzt geladenen Beiträge bleiben sichtbar.' : 'Beiträge konnten nicht geladen werden. Bitte erneut versuchen oder die Originalseite öffnen.')
-      : `Zuletzt geladen: ${state.updatedAt.toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' })} · ${state.items.length} Beiträge im Feed`;
+    status.textContent = state.loading ? 'Webseite und Feed werden abgeglichen …'
+      : state.error ? (state.updatedAt ? 'Datumsabgleich fehlgeschlagen. Die zuletzt geladenen Beiträge bleiben sichtbar.' : 'Feed nicht erreichbar. Beiträge der Startseite bleiben ohne RSS-Ergänzung verfügbar.')
+      : `Abgeglichen: ${state.updatedAt.toLocaleTimeString('de-DE', { hour: '2-digit', minute: '2-digit' })} · ${state.pageItems.length} Webseitenbeiträge · ${state.feedItems.length} Feed-Beiträge`;
     shadow.querySelector('#reader-content').setAttribute('aria-busy', String(state.loading));
     shadow.querySelector('#refresh').disabled = state.loading;
   }
 
+  function undatedHtml(items) {
+    if (!items.length) return '';
+    const visible = state.undatedExpanded ? items : items.slice(0, INITIAL_OVERVIEW_COUNT);
+    const title = items.some(item => item.fromPage) ? 'Weitere Beiträge der Startseite' : 'Beiträge ohne Datum';
+    return `<section id="undated-section" class="overview-section undated-section" aria-label="${title}">
+      <div class="section-head"><h2>${title}</h2><span>${visible.length} von ${items.length}</span></div>
+      <p class="section-note">Ohne verlässliche Datumsangabe. Diese Beiträge bleiben unabhängig vom gewählten Zeitraum sichtbar.</p>
+      <div id="undated-list">${visible.map(overviewItemHtml).join('')}</div>
+      ${items.length > INITIAL_OVERVIEW_COUNT ? `<button id="toggle-undated" class="more-button" type="button" aria-expanded="${state.undatedExpanded}" aria-controls="undated-list">${state.undatedExpanded ? 'Weniger anzeigen' : `${items.length - INITIAL_OVERVIEW_COUNT} weitere Beiträge anzeigen`}</button>` : ''}
+    </section>`;
+  }
+
   function renderContent(shadow) {
-    const list = currentItems();
+    const selection = currentItems();
+    const list = selection.filter(item => item.publishedAt !== null);
+    const undated = selection.filter(item => item.publishedAt === null);
     const content = shadow.querySelector('#reader-content');
     const count = shadow.querySelector('#article-count');
     if (!content || !count) return;
 
-    count.textContent = `${list.length} ${list.length === 1 ? 'Beitrag' : 'Beiträge'}`;
+    count.textContent = `${selection.length} ${selection.length === 1 ? 'Beitrag' : 'Beiträge'}`;
 
-    if (!list.length) {
+    if (!selection.length) {
       content.innerHTML = state.loading ? '<div class="empty">Die neuesten Beiträge werden geladen …</div>'
         : state.error && !state.updatedAt ? '<div class="empty"><strong>Der Nachrichtenabruf ist fehlgeschlagen.</strong><p><button class="secondary" type="button" id="retry-feed">Erneut versuchen</button></p></div>'
         : '<div class="empty"><strong>Keine Beiträge in dieser Auswahl.</strong><br>Wähle einen anderen Zeitraum oder „Alle Formate“.</div>';
+      return;
+    }
+
+    if (!list.length) {
+      content.innerHTML = undatedHtml(undated);
       return;
     }
 
@@ -272,7 +391,7 @@
       ${overview.length ? `
         <section class="overview-section">
           <div class="section-head">
-            <h2>${compact ? 'Alle Beiträge' : 'Im Überblick'}</h2>
+            <h2>${compact ? 'Nach Datum geordnet' : 'Im Überblick'}</h2>
             <span>${visibleOverview.length} von ${overview.length}</span>
           </div>
           <div id="overview-list" class="overview-list">${visibleOverview.map(overviewItemHtml).join('')}</div>
@@ -281,6 +400,7 @@
               ${state.expanded ? 'Weniger anzeigen' : `${hiddenCount} weitere Beiträge anzeigen`}
             </button>` : ''}
         </section>` : ''}
+      ${undatedHtml(undated)}
     `;
   }
 
@@ -317,8 +437,8 @@
           <div class="intro">
             <div>
               <p class="eyebrow">Wissenschaft ohne Umwege</p>
-              <h1>Neu bei Spektrum.</h1>
-              <p class="intro-copy">Wissenschaft entdecken. Nach Datum geordnet.</p>
+              <h1>Spektrum, aufgeräumt.</h1>
+              <p class="intro-copy">Nachrichten, Kolumnen und mehr. In Ruhe lesen.</p>
             </div>
             <div class="intro-tools">
               <div id="article-count" class="count" role="status" aria-live="polite" aria-atomic="true"></div>
@@ -330,13 +450,13 @@
           </div>
           <div class="feed-tools">
             <label class="period-choice">Zeitraum <select id="period">
-              <option value="3">Letzte 3 Tage</option><option value="7">Letzte 7 Tage</option><option value="all">Alle Feed-Beiträge</option>
+              <option value="3">Letzte 3 Tage</option><option value="7">Letzte 7 Tage</option><option value="all">Alle datierten Beiträge</option>
             </select></label>
             <div id="feed-status" class="feed-status" role="status" aria-live="polite"></div>
           </div>
           <nav class="filters" aria-label="Formate filtern">${filterButtons([])}</nav>
           <div id="reader-content"></div>
-          <footer>Leseransicht ${VERSION} · Inhalte und Bilder: Spektrum.de.<br>Quelle: <a href="${FEED_PATH}">Spektrum-RSS-Feed</a> · Der Feed enthält die zuletzt bereitgestellten Beiträge und ist kein vollständiges Archiv.</footer>
+          <footer>Leseransicht ${VERSION} · Inhalte und Bilder: Spektrum.de.<br>Quellen: geladene Startseite und <a href="${FEED_PATH}">RSS-Feed</a> (kein vollständiges Archiv). Undatierte Beiträge stehen separat.</footer>
         </main>
       </div>
 
@@ -508,6 +628,8 @@
     .visual-card a:hover h2, .overview-item a:hover h3 { text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 4px; }
 
     .overview-section { width: min(940px, 100%); margin: 0 auto; }
+    .undated-section { margin-top: 48px; }
+    .section-note { color: var(--muted); font-size: 13px; line-height: 1.5; }
     .section-head {
       display: flex;
       align-items: baseline;
@@ -640,6 +762,8 @@
 
   async function refresh(shadow) {
     if (state.loading) return;
+    state.pageItems = extractPageItems();
+    mergeSources();
     state.loading = true;
     state.error = false;
     renderFeedStatus(shadow);
@@ -651,15 +775,17 @@
         credentials: 'omit', cache: 'no-cache', signal: controller.signal
       });
       if (!response.ok) throw new Error(`RSS HTTP ${response.status}`);
-      state.items = parseFeed(await response.text());
+      state.feedItems = parseFeed(await response.text());
       state.updatedAt = new Date();
       state.expanded = false;
+      state.undatedExpanded = false;
     } catch (error) {
       state.error = true;
       console.warn('[Spektrum Leseransicht] RSS konnte nicht geladen werden:', error.message);
     } finally {
       clearTimeout(timer);
       state.loading = false;
+      mergeSources();
       renderFilters(shadow);
       renderContent(shadow);
       renderFeedStatus(shadow);
@@ -690,6 +816,7 @@
       if (event.target.id !== 'period') return;
       state.days = event.target.value;
       state.expanded = false;
+      state.undatedExpanded = false;
       renderFilters(shadow);
       renderContent(shadow);
     });
@@ -699,6 +826,7 @@
       if (filter) {
         state.filter = filter.dataset.filter || 'all';
         state.expanded = false;
+        state.undatedExpanded = false;
         shadow.querySelectorAll('.filter').forEach(btn => {
           btn.classList.toggle('is-active', btn === filter);
           btn.setAttribute('aria-pressed', String(btn === filter));
@@ -712,6 +840,7 @@
       if (layout) {
         state.layout = layout.dataset.layout;
         state.expanded = false;
+        state.undatedExpanded = false;
         try { localStorage.setItem(LAYOUT_KEY, state.layout); } catch { /* Storage may be blocked. */ }
         shadow.querySelectorAll('[data-layout]').forEach(btn => btn.setAttribute('aria-pressed', String(btn === layout)));
         renderContent(shadow);
@@ -725,6 +854,15 @@
         renderContent(shadow);
         shadow.querySelector('#toggle-more')?.focus({ preventScroll: true });
         if (!state.expanded && Number.isFinite(sectionTop)) window.scrollTo({ top: sectionTop - 82, behavior: 'instant' });
+        return;
+      }
+
+      if (event.target.closest('#toggle-undated')) {
+        state.undatedExpanded = !state.undatedExpanded;
+        const top = shadow.querySelector('#undated-section').getBoundingClientRect().top + window.scrollY;
+        renderContent(shadow);
+        shadow.querySelector('#toggle-undated')?.focus({ preventScroll: true });
+        if (!state.undatedExpanded) window.scrollTo({ top: top - 82, behavior: 'instant' });
         return;
       }
 
